@@ -1,0 +1,981 @@
+import csv
+import io
+import sys
+import tempfile
+
+import amp_standard_ara_generate_report_properties as props
+import boto3
+import openpyxl
+from openpyxl.styles import Alignment, Border, Side
+
+s3_client = boto3.client("s3")
+
+"""
+Examples inputs: 
+1) python generate_MMS_report.py 'PNCA' 'new models.csv' 'used models.csv' 'Input_record_counts.csv' 'Test_PCNA_HPS_MMS_Report_07.xlsx' 
+    /data/cluster/disk3/TEMP/Gage/ARA/Report_generation/2019-07 "02/01/2019 - 05/30/2019"
+
+2) python generate_MMS_report.py 'PNCA' 'new models.csv' 'used models.csv' 'Input_record_counts.csv' 'Test_PCNA_HPS_MMS_Report_03.xlsx' 
+    /data/cluster/disk3/TEMP/Gage/ARA/Report_generation/2019-03_reports "10/16/2018 - 01/31/2019" "07/26/2018 - 10/16/2018" "10/26/2018 - 01/31/2019" "08/22/2018 - 10/26/2018"
+
+General input: python generate_MMS_report.py 'costomer name' 'new cars .csv file' 'used car .csv file' 'record count file .csv file' 'name of output file'  'directory' data ranges  ...... 
+
+"""
+
+
+def read_csv_from_s3(bucket_name, key):
+    """
+    Reads a CSV file from an s3 bucket and returns a csv.reader object
+    :param bucket:
+    :param key:
+    :return:
+    """
+    response = s3_client.get_object(Bucket=bucket_name, Key=key)
+    lines = response["Body"].read().decode("utf-8").splitlines()
+    return csv.reader(lines)
+
+
+def formulas(ws, c_index, r_index):
+    """
+    The MMS sheet has two different formulas that goes on each row
+    First is =IF(ISNUMBER(c_index r_index),c_indexr_index/c_index$9*100,c_indexr_index)
+    Second is =IF(ISNUMBER(c_index r_index),c_index r_index/c_index$7*100,c_index r_index)
+
+    First one is if the vehicle count for r_index is a value then vehicle count/total vehicle count which is vehicle mix
+    Second one is if  the vehicle count for r_index is a value then vehicle count/Recod count which is conv rate
+    """
+
+    # Since the size of the columns are modified a dictionary matching number to letter is needed
+    num_to_let = props.NUM_TO_EXCEL_COLUMN
+
+    # Set up formulas
+    veh_mix = (
+        "=IF(ISNUMBER("
+        + num_to_let[int(c_index)]
+        + str(r_index)
+        + "),"
+        + num_to_let[int(c_index)]
+        + str(r_index)
+        + "/"
+        + num_to_let[int(c_index)]
+        + "$9*100,"
+        + num_to_let[int(c_index)]
+        + str(r_index)
+        + ")"
+    )
+    conv_rate = (
+        "=IF(ISNUMBER("
+        + num_to_let[int(c_index)]
+        + str(r_index)
+        + "),"
+        + num_to_let[int(c_index)]
+        + str(r_index)
+        + "/"
+        + num_to_let[int(c_index)]
+        + "$7*100,"
+        + num_to_let[int(c_index)]
+        + str(r_index)
+        + ")"
+    )
+
+    # Write out the formula
+    formula_cell_1 = ws.cell(row=int(r_index), column=int(c_index) + 1)
+    formula_cell_2 = ws.cell(row=int(r_index), column=int(c_index) + 2)
+
+    formula_cell_1.font = props.data_font
+    formula_cell_2.font = props.data_font
+
+    formula_cell_1.value = veh_mix
+    formula_cell_2.value = conv_rate
+
+    reg_zero_hash = "##0.00"
+
+    formula_cell_1.number_format = reg_zero_hash
+    formula_cell_2.number_format = reg_zero_hash
+
+    if (int(r_index) % 2) == 0:
+        formula_cell_1.fill = props.unique_mss_report_fill
+        formula_cell_2.fill = props.unique_mss_report_fill
+
+    formula_cell_1.border = props.bottom_right_border
+    formula_cell_2.border = props.bottom_right_border
+
+    formula_cell_1.alignment = Alignment(horizontal="right")
+    formula_cell_2.alignment = Alignment(horizontal="right")
+
+
+def fix_border_up_total(r_index, end_c_index, ws):
+    cell_1 = ws.cell(row=r_index, column=1)
+    if r_index == 3:
+        cell_1.border = props.bottom_right_border
+    else:
+        cell_1.border = Border(right=Side(border_style="thin", color="00000000"))
+    c_index = 2
+    while c_index < end_c_index:
+        cell_1 = ws.cell(row=r_index, column=c_index)
+        cell_1.border = Border(bottom=Side(border_style="thin", color="00000000"))
+        c_index += 1
+    cell_1 = ws.cell(row=r_index, column=end_c_index)
+    cell_1.border = props.bottom_right_border
+
+
+def fix_border_by_segment(r_index, end_c_index, ws):
+    cell_1 = ws.cell(row=r_index, column=1)
+    if r_index == 3 or r_index > 7:
+        cell_1.border = props.bottom_right_border
+    else:
+        cell_1.border = Border(right=Side(border_style="thin", color="00000000"))
+    c_index = 2
+    while c_index < end_c_index:
+        cell_1 = ws.cell(row=r_index, column=c_index)
+        if (c_index - 1) % 3 == 0:
+            cell_1.border = props.bottom_right_border
+        else:
+            cell_1.border = Border(bottom=Side(border_style="thin", color="00000000"))
+        c_index += 1
+    cell_1 = ws.cell(row=r_index, column=end_c_index)
+    cell_1.border = props.bottom_right_border
+
+
+def fill_report(  # NOSONAR
+    customer_name,
+    bucket_name,
+    file_name,
+    rec_cnt_file,
+    date_ranges,
+    ws,
+    one_pre_win_flag,
+    bucket_prefix,
+):
+    """Put togethear the BPS script
+    (1.a) Set up lists and directories for latter use in the script
+    (1.b) Set up all the formatting stuff for the sheet
+    (2) Grab the Recorded counts from the record_count.csv file from the command line
+    (3) Write the first two headers to the sheet
+    (4) Extract the data from the data .csv file writeout formatted vehicle names to the sheet
+    (5) Test if there is will be one performance window or multiple windows
+    (6) Writeout the vehicle information that is provided and writeout zeros in all the empty place to the sheet
+        Also call the formulas funcation to writeout the formula for vehicle mix and conv rate for each vehicle and event location
+    (7) Writeout Formula to calculate the total record count, total vehicle count, and a total vehicle count for each vehicle type
+    (8) Write out the column header for each event location, the record count and record count header, the header for the three sub columns
+        and the formula for the total of each of those columns, this all being for each event location
+    (9) Writeout the performace window either one or multiple
+    (10) Writeout the other pieces of the header and merge the header cells to span data section, except the total section
+    (11) Place the Experian logo right above the totals section on the sheet and clean up any broken formatting
+    """
+
+    ######################################
+    # Step 1.a
+
+    # Since the size of the columns are modified a dictionary matching number to letter is needed
+    num_to_let = props.NUM_TO_EXCEL_COLUMN
+
+    # Set an empty list to capture the event location and for the full event location names
+    location_names = []
+
+    # Set up an empty list to collect all the different vehicles from either the new or used model file
+    vehicles = []
+
+    # Set up three dictionaries:
+    # One to keep track of new locations based of the vehicles
+    # Two to hold a location and the column index that it resids
+    # Three to keep track of row, column, vehicle count based on location of event
+    veh_cnt_new = {}
+    veh_cnt_header_index = {}
+    veh_cnt_and_loc = {}
+
+    no_total = "f"
+
+    ######################################
+    # Step 1.b
+
+    # Set up fill color
+    blue_fill = props.blue_fill
+    white_fill = props.white_fill
+
+    # Set up font types
+    data_font = props.data_font
+    column_name_font = props.column_name_font
+
+    # Set up boards
+    bottom_right_border = props.bottom_right_border
+    top_right_bottom_border = props.top_right_bottom_border
+    top_bottom_border = props.top_bottom_border
+
+    reg_comma_zero_hash = "#,##0"
+
+    # Step 2 Grab Record counts for the header
+    try:
+        r_index = 7
+        c_index = 2
+        data = read_csv_from_s3(bucket_name, rec_cnt_file)
+        next(data)
+
+        for row in data:
+            # Grab record count from the file
+            event_location = str(row[0])
+            rec_cnt = int(row[1])
+            veh_cnt_header_index[event_location] = c_index
+
+            rec_cnt_cell = ws.cell(row=r_index, column=c_index)
+            rec_cnt_cell.font = column_name_font
+            rec_cnt_cell.value = rec_cnt
+            rec_cnt_cell.number_format = reg_comma_zero_hash
+            rec_cnt_cell.border = bottom_right_border
+            rec_cnt_cell.alignment = Alignment(horizontal="center")
+            c_index += 3
+    except Exception as e:
+        print("Error opening", bucket_name, "/", rec_cnt_file, e)
+        sys.exit(1)
+
+    ######################################
+    # Step 3
+
+    # Set up the starting row for the column of vehicles
+    r_index = 12
+    c_index = 1
+
+    # Write out the row names into row 9 and 10
+    # Format the width of the Vehicle colmun.
+
+    row_header_cell = ws.cell(row=9, column=1)
+    column_header_cell = ws.cell(row=10, column=1)
+
+    row_header_cell.font = column_name_font
+    column_header_cell.font = column_name_font
+
+    row_header_cell.value = "Vehicle Count"
+    column_header_cell.value = "Make Model"
+
+    row_header_cell.border = top_right_bottom_border
+    column_header_cell.border = top_right_bottom_border
+
+    row_header_cell.alignment = Alignment(horizontal="left")
+    column_header_cell.alignment = Alignment(horizontal="left")
+
+    ######################################
+    # Step 4
+    reg_zero_hash = "##0.00"
+
+    try:
+        data = read_csv_from_s3(bucket_name, file_name)
+        next(data)
+        test_location = next(data)
+        test_location = str(test_location[1])
+        data = read_csv_from_s3(bucket_name, file_name)
+        next(data)
+
+        i = 2
+        veh_cnt_new[test_location] = 0
+        location_name = props.clean_location_name(test_location)
+        location_name = location_name.strip()  # NOSONAR
+        location_names.append(test_location)
+        old_vehicle_type = ""
+        i += 3
+
+        # Widen vehicle column
+        ws.column_dimensions[num_to_let[1]].width = 40
+
+        for row in data:
+
+            # Place the data from the current record in to variables
+            vehicle_type = str(row[0])
+            location_event = str(row[1])
+            num_of_vehicles = int(row[2])
+
+            # track vehicles for each location and collect only the new location names
+            if location_event in veh_cnt_new.keys():
+                count = veh_cnt_new[location_event]
+                count = count + num_of_vehicles
+                veh_cnt_new[location_event] = count
+            else:
+                veh_cnt_new[location_event] = 1
+
+                # Format the event locations and add them to list for latter processing
+                location_name = props.clean_location_name(location_event)
+                location_name = location_name.strip()
+
+                location_names.append(location_event)
+                i += 3
+
+            # If the vehicles repeat it means that the vehicle is in my multiple locations
+            # Append the extra location to the one vehicle infomation
+            # This is done to keep all the infomation on one line
+            if vehicle_type == old_vehicle_type:
+
+                vehicle_type = vehicle_type.strip()
+                veh_info = veh_cnt_and_loc[vehicle_type]
+                veh_info.append(location_event)
+                veh_info.append(
+                    str(veh_cnt_header_index[location_event])
+                    + ":"
+                    + str(r_index - 1)
+                    + ":"
+                    + str(num_of_vehicles)
+                )
+                veh_cnt_and_loc[vehicle_type] = veh_info
+
+            # Else write the vehicle name out to the sheet and start a new list for the next vehicle
+            else:
+                vehicles.append(vehicle_type.strip())
+                # Write out the vehicles
+                vehicle_cell = ws.cell(row=r_index, column=1)
+                vehicle_cell.font = data_font
+                vehicle_cell.value = vehicle_type
+                if (r_index % 2) == 0:
+                    vehicle_cell.fill = blue_fill
+
+                vehicle_cell.border = bottom_right_border
+                vehicle_cell.alignment = Alignment(horizontal="left")
+                old_vehicle_type = vehicle_type
+
+                # Add vehicle name to veh_cnt_and_location to match each vehicle's and location to a count
+                # The point is not every location has every vehicle so matching count to the vehicle
+                # will make written out the info easier
+                vehicle_type = vehicle_type.strip()
+                veh_info = []
+                veh_info.append(location_event.strip())
+                veh_info.append(
+                    str(veh_cnt_header_index[location_event])
+                    + ":"
+                    + str(r_index)
+                    + ":"
+                    + str(num_of_vehicles)
+                )
+                veh_cnt_and_loc[vehicle_type] = veh_info
+
+                r_index += 1
+        total_c_index = i
+    except Exception as e:
+        print("Error opening", bucket_name, "/", rec_cnt_file, e)
+        sys.exit(1)
+
+    ######################################
+    # Step 5
+
+    # Test if there are multiple performance windows
+    if one_pre_win_flag:
+        pw_one_cell = "t"
+    else:
+        pw_one_cell = "f"
+
+    # Fill in the body of the sheet
+    r_index = 12
+    i = 0
+
+    if len(location_names) == 1:
+        no_total = "t"
+
+    ######################################
+    # Step 6
+
+    # Since each row and column with in the bounds must be filled.
+    # A check too see if every vehicle count must be made.
+    # If each has a value loop across the rows placing the values.
+    # Else place zeros where no vehicle count is recorded and the recorded value every were else.
+    # This check must be performed on each row of data.
+    while i < len(vehicles):
+        vehicle_cell = ws.cell(row=12 + i, column=1)
+        vehicle_type = vehicle_cell.value
+        vehicle_type = vehicle_type.strip()
+        veh_info = veh_cnt_and_loc[vehicle_type]
+        t = 0
+
+        # Check if each location had this vehicle
+        # If true write the recorded data across the row for each location
+        if len(veh_info) == (len(location_names) * 2):
+            while t < len(veh_info):
+                c_index, r_index_, num_of_veh = veh_info[t + 1].split(":")
+                data_cell = ws.cell(row=int(r_index_), column=int(c_index))
+                data_cell.font = data_font
+                data_cell.value = int(num_of_veh)
+                data_cell.number_format = reg_comma_zero_hash
+                if (r_index % 2) == 0:
+                    data_cell.fill = blue_fill
+                data_cell.border = bottom_right_border
+                data_cell.alignment = Alignment(horizontal="right")
+                formulas(ws, c_index, r_index_)
+                t += 2
+
+        # Else write zeros where there was no recorded vehcles
+        else:
+            name_index = 0
+            t = 0
+            while name_index < len(location_names):
+
+                # Check if the location has the vehicle
+                if location_names[name_index] in veh_info:
+                    c_index, r_index_, num_of_veh = veh_info[t + 1].split(":")
+                    data_cell = ws.cell(row=int(r_index_), column=int(c_index))
+                    data_cell.font = data_font
+                    data_cell.value = int(num_of_veh)
+                    data_cell.number_format = reg_comma_zero_hash
+                    if (r_index % 2) == 0:
+                        data_cell.fill = blue_fill
+                    data_cell.border = bottom_right_border
+                    data_cell.alignment = Alignment(horizontal="right")
+                    formulas(ws, c_index, r_index_)
+                    name_index += 1
+                    t += 2
+                else:
+                    c_index, r_index_, num_of_veh = veh_info[1].split(":")
+                    c_index = veh_cnt_header_index[location_names[name_index]]
+                    data_cell = ws.cell(row=int(r_index_), column=int(c_index))
+                    data_cell.font = data_font
+                    data_cell.value = 0
+                    if (r_index % 2) == 0:
+                        data_cell.fill = blue_fill
+                    data_cell.border = bottom_right_border
+                    data_cell.alignment = Alignment(horizontal="right")
+                    formulas(ws, c_index, r_index_)
+                    name_index += 1
+
+        i += 1
+        r_index += 1
+    end_r_index = r_index
+
+    ######################################
+    # Step 7
+
+    if no_total != "t":
+        # Totals colmun:
+        r_index = 12
+        i = 0
+
+        # Formula for total record count and total vehicle count
+        total_rec_count = "="
+        c_index = total_c_index
+        c_index -= 3
+        while c_index > 1:
+            total_rec_count = total_rec_count + num_to_let[c_index] + "7+"
+            c_index -= 3
+
+        # Formula for total vehicle count
+        while i < len(vehicles):
+
+            c_index = total_c_index
+            c_index -= 3
+
+            total_veh_count = "="
+            while c_index > 1:
+                total_veh_count = (
+                    total_veh_count + num_to_let[c_index] + str(r_index) + "+"
+                )
+                c_index -= 3
+
+            # Write out the formula for each total
+            rec_cnt_cell = ws.cell(row=r_index, column=total_c_index)
+            rec_cnt_cell.font = data_font
+            rec_cnt_cell.value = total_veh_count[:-1]
+            rec_cnt_cell.number_format = reg_comma_zero_hash
+            if (r_index % 2) == 0:
+                rec_cnt_cell.fill = blue_fill
+            rec_cnt_cell.border = bottom_right_border
+            rec_cnt_cell.alignment = Alignment(horizontal="right")
+            formulas(ws, total_c_index, r_index)
+
+            i += 1
+            r_index += 1
+
+        # Add total to the column indexing
+        veh_cnt_header_index["total"] = total_c_index
+
+        # Write out the formula for total records
+        rec_cnt_cell = ws.cell(row=7, column=total_c_index)
+        rec_cnt_cell.font = column_name_font
+        rec_cnt_cell.value = total_rec_count[:-1]
+        rec_cnt_cell.number_format = reg_comma_zero_hash
+        rec_cnt_cell.border = bottom_right_border
+        rec_cnt_cell.alignment = Alignment(horizontal="center")
+
+    # Header
+
+    ######################################
+    # Step 8
+
+    # Write out the event name locations, fixed infomation and record count
+    # Also write out the total formulas
+    for i in range(len(veh_cnt_header_index)):
+        if i < len(location_names):
+            event_location = location_names[i]
+        else:
+            event_location = "total"
+
+        c_index = veh_cnt_header_index[event_location]
+
+        # Set up formulas for the vehicle mix, conv rate and total vehicle for location X
+        f_veh_mix = (
+            "=SUM("  # NOSONAR
+            + num_to_let[c_index + 1]
+            + "12"
+            + ":"
+            + num_to_let[c_index + 1]
+            + str(end_r_index)
+            + ")"
+        )
+        f_conv_rate = (
+            "=SUM("  # NOSONAR
+            + num_to_let[c_index + 2]
+            + "12"
+            + ":"
+            + num_to_let[c_index + 2]
+            + str(end_r_index)
+            + ")"
+        )
+        veh_sum = (
+            "=SUM("
+            + num_to_let[c_index]
+            + "12"
+            + ":"
+            + num_to_let[c_index]
+            + str(end_r_index)
+            + ")"
+        )
+
+        # Merge cells togeather for two of the header cells and the record count
+        ws.merge_cells(
+            start_row=4, start_column=c_index, end_row=5, end_column=(c_index + 2)
+        )
+        ws.merge_cells(
+            start_row=6, start_column=c_index, end_row=6, end_column=(c_index + 2)
+        )
+        ws.merge_cells(
+            start_row=7, start_column=c_index, end_row=7, end_column=(c_index + 2)
+        )
+
+        # Write out the data
+        header_cell_1 = ws.cell(row=4, column=c_index)
+        header_cell_2 = ws.cell(row=6, column=c_index)
+        c_header_cell_1 = ws.cell(row=8, column=c_index)
+        c_header_cell_2 = ws.cell(row=8, column=c_index + 1)
+        c_header_cell_3 = ws.cell(row=8, column=c_index + 2)
+        count_cell_1 = ws.cell(row=9, column=c_index)
+        count_cell_2 = ws.cell(row=9, column=c_index + 1)
+        count_cell_3 = ws.cell(row=9, column=c_index + 2)
+
+        header_cell_1.font = column_name_font
+        header_cell_2.font = column_name_font
+        c_header_cell_1.font = column_name_font
+        c_header_cell_2.font = column_name_font
+        c_header_cell_3.font = column_name_font
+        count_cell_1.font = data_font
+        count_cell_2.font = data_font
+        count_cell_3.font = data_font
+
+        if event_location != "total":
+            header_cell_1.value = event_location
+            count_cell_1.value = veh_sum
+
+        else:
+            if no_total != "t":
+                header_cell_1.value = ""
+                count_cell_1.value = veh_sum
+
+        header_cell_2.value = "Record Count"
+        c_header_cell_1.value = "Vehicle Count"
+        c_header_cell_2.value = "Vehicle Mix (%)"
+        c_header_cell_3.value = "Conv Rate (%)"
+        count_cell_2.value = f_veh_mix
+        count_cell_3.value = f_conv_rate
+
+        # Format the nermarics
+        count_cell_1.number_format = reg_comma_zero_hash
+        count_cell_2.number_format = reg_zero_hash
+        count_cell_3.number_format = reg_zero_hash
+
+        # Place border on non-merged cells
+        c_header_cell_1.border = top_right_bottom_border
+        c_header_cell_2.border = top_right_bottom_border
+        c_header_cell_3.border = top_right_bottom_border
+        count_cell_1.border = bottom_right_border
+        count_cell_2.border = bottom_right_border
+        count_cell_3.border = bottom_right_border
+
+        # Place border on merged cells
+        i = 0
+        r_index = 5
+
+        # Location event cell
+        cell_1 = ws.cell(row=r_index, column=c_index)
+        cell_2 = ws.cell(row=r_index, column=c_index + 1)
+        cell_3 = ws.cell(row=r_index, column=c_index + 2)
+        cell_4 = ws.cell(row=r_index + 1, column=c_index + 2)
+        cell_1.border = Border(top=Side(border_style="thin", color="00000000"))
+        cell_2.border = Border(top=Side(border_style="thin", color="00000000"))
+        cell_3.border = Border(
+            top=Side(border_style="thin", color="00000000"),
+            right=Side(border_style="thin", color="00000000"),
+        )
+        cell_4.border = Border(right=Side(border_style="thin", color="00000000"))
+
+        r_index += 2
+        while r_index < 8:
+            cell_1 = ws.cell(row=r_index, column=c_index)
+            cell_2 = ws.cell(row=r_index, column=c_index + 1)
+            cell_3 = ws.cell(row=r_index, column=c_index + 2)
+            cell_1.border = top_bottom_border
+            cell_2.border = top_bottom_border
+            cell_3.border = top_right_bottom_border
+            r_index += 1
+
+        header_cell_1.alignment = Alignment(horizontal="center", vertical="center")
+        header_cell_2.alignment = Alignment(horizontal="center")
+        c_header_cell_1.alignment = Alignment(horizontal="center")
+        c_header_cell_2.alignment = Alignment(horizontal="center")
+        c_header_cell_3.alignment = Alignment(horizontal="center")
+        count_cell_1.alignment = Alignment(horizontal="right")
+        count_cell_2.alignment = Alignment(horizontal="right")
+        count_cell_3.alignment = Alignment(horizontal="right")
+
+    ######################################
+    # Step 9
+
+    r_index = 1
+    end_c_index = c_index
+    if no_total == "t":
+        end_c_index += 3
+
+    # Fixed part of the Performance Window
+    time_window = "Performance Window:  "
+
+    # Write time window as one cell if the string had the format "location event attendees"
+    # Else write out multiple cells depending on if "non-Event" or "Event"
+    if pw_one_cell == "t":
+        header_cell_3 = ws.cell(row=3, column=2)
+        header_cell_3.font = column_name_font
+        header_cell_3.value = time_window + list(date_ranges.values())[0]
+        header_cell_3.alignment = Alignment(horizontal="center")
+        ws.merge_cells(
+            start_row=3, start_column=2, end_row=3, end_column=(end_c_index - 1)
+        )
+    else:
+        # Check each event and give it the correct per-window
+        # c_index = 2
+        for i in range(len(location_names)):
+            # Get event number
+            pw = date_ranges[location_names[i]]
+            c_index = veh_cnt_header_index[location_names[i]]
+
+            # Write to the sheet the desided infomation
+            # header_cell_3 = ws.cell(row = 3, column = c_index + i)
+            header_cell_3 = ws.cell(row=3, column=c_index)
+            header_cell_3.font = column_name_font
+            header_cell_3.value = time_window + pw
+            header_cell_3.alignment = Alignment(horizontal="center")
+            # ws.merge_cells(start_row = 3, start_column = (c_index + i), end_row = 3, end_column = (c_index + 2 + i))
+            ws.merge_cells(
+                start_row=3, start_column=(c_index), end_row=3, end_column=(c_index + 2)
+            )
+
+    ######################################
+    # Step 10
+
+    # Fixed infomation for the title
+    sheet_name = ws.title
+    if sheet_name.count("Used") > 0:
+        bnbu = "Used"
+    else:
+        bnbu = "New"
+    title = (
+        "Make Model Purchase Summary Report for '"
+        + bnbu
+        + "' Vehicles for "
+        + customer_name
+    )
+    done_by = "Prepared by: Experian Automotive"
+
+    # Writeout the fixed data
+    header_cell_1 = ws.cell(row=1, column=2)
+    header_cell_2 = ws.cell(row=2, column=2)
+
+    header_cell_1.font = column_name_font
+    header_cell_2.font = column_name_font
+
+    header_cell_1.value = title
+    header_cell_2.value = done_by
+
+    header_cell_1.alignment = Alignment(horizontal="center")
+    header_cell_2.alignment = Alignment(horizontal="center")
+
+    # Merge header cells
+    while r_index < 3:
+        c_index = 2
+        ws.merge_cells(
+            start_row=r_index,
+            start_column=2,
+            end_row=r_index,
+            end_column=(end_c_index - 1),
+        )
+        r_index += 1
+
+    # Convert the formuals in the sheet into values
+    props.process_report(ws)
+
+    ######################################
+    # Step 11
+    try:
+        if no_total == "t":
+            end_c_index -= 1
+        # Place logo into header of the sheet
+
+        with tempfile.NamedTemporaryFile(delete=False) as temp_logo:
+            object_prefix = f"{bucket_prefix}/{props.EXPERIAN_LOGO}"
+            s3_client.download_file(bucket_name, object_prefix, temp_logo.name)
+            experian_logo = openpyxl.drawing.image.Image(temp_logo.name)
+        if no_total != "t":
+            ws.merge_cells(
+                start_row=1,
+                start_column=end_c_index,
+                end_row=3,
+                end_column=(end_c_index + 2),
+            )
+
+        anchor_cell = "E{}".format(end_c_index - 3)
+        experian_logo.anchor = anchor_cell
+        ws.add_image(experian_logo)
+        if no_total == "t":
+            end_c_index += 1
+    except Exception as e:
+        print("Error opening: ", str(e))
+        sys.exit(1)
+
+    # White fill and adjust column widths
+
+    if no_total == "t":
+        total_c_index -= 3
+
+    widen = 15
+    if no_total == "t":
+        total_c_index += 3
+        widen = 23.5
+
+    # Resize nermaric columns
+    c_index = 2
+    while c_index < end_c_index + 3:
+        ws.column_dimensions[num_to_let[c_index]].width = widen
+        c_index += 1
+
+    # Fill in the cells and place border on the cells in the upper left corner of the sheet
+    c_index = 1
+    r_index = 1
+    end_r_index = 10
+
+    cell = ws.cell(row=r_index, column=c_index)
+    cell.fill = white_fill
+    r_index += 1
+
+    while r_index < end_r_index:
+        cell = ws.cell(row=r_index, column=c_index)
+        cell.fill = white_fill
+        r_index += 1
+
+    if no_total != "t":
+
+        # Fill in the cells and place border on the cells above the total column
+        c_index = total_c_index + 2
+        r_index = 1
+        end_r_index = 5
+
+        cell_1 = ws.cell(row=r_index, column=c_index)
+        cell_2 = ws.cell(row=r_index, column=c_index - 1)
+        cell_3 = ws.cell(row=r_index, column=c_index - 2)
+
+        cell_1.fill = white_fill
+        cell_2.fill = white_fill
+        cell_3.fill = white_fill
+
+        r_index += 1
+
+        while r_index < end_r_index:
+            cell = ws.cell(row=r_index, column=c_index)
+            cell.fill = white_fill
+            r_index += 1
+
+    else:
+        ws.merge_cells(start_row=1, start_column=5, end_row=3, end_column=5)
+
+    # Fix boarders
+    end_c_index -= 1
+    for i in range(10):
+        r_index = i + 1
+
+        if r_index < 3:
+            fix_border_up_total(r_index, end_c_index, ws)
+
+            if no_total != "t":
+                cell_1 = ws.cell(row=r_index, column=(end_c_index + 3))
+                cell_1.border = Border(
+                    right=Side(border_style="thin", color="00000000")
+                )
+        elif r_index == 3:
+            if pw_one_cell == "t":
+                p = "e"  # NOSONAR
+                fix_border_up_total(r_index, end_c_index, ws)
+            else:
+                p = "e"  # NOSONAR
+                fix_border_by_segment(r_index, end_c_index, ws)
+            if no_total != "t":
+                cell_1 = ws.cell(row=r_index, column=(end_c_index + 1))
+                cell_2 = ws.cell(row=r_index, column=(end_c_index + 2))
+                cell_3 = ws.cell(row=r_index, column=(end_c_index + 3))
+                cell_1.border = Border(
+                    bottom=Side(border_style="thin", color="00000000")
+                )
+                cell_2.border = Border(
+                    bottom=Side(border_style="thin", color="00000000")
+                )
+                cell_3.border = props.bottom_right_border
+        elif r_index == 4:
+            cell_1 = ws.cell(row=r_index, column=1)
+            cell_1.border = Border(right=Side(border_style="thin", color="00000000"))
+            for i in range(int((end_c_index - 1) / 3)):
+                i += 1
+                cell_1 = ws.cell(row=r_index, column=((3 * i) + 1))
+                cell_1.border = Border(
+                    right=Side(border_style="thin", color="00000000")
+                )
+            if no_total != "t":
+                cell_1 = ws.cell(row=r_index, column=(end_c_index + 3))
+                cell_1.border = Border(
+                    right=Side(border_style="thin", color="00000000")
+                )
+        elif r_index == 5:
+            fix_border_by_segment(r_index, end_c_index, ws)
+            if no_total != "t":
+                cell_1 = ws.cell(row=r_index, column=(end_c_index + 1))
+                cell_2 = ws.cell(row=r_index, column=(end_c_index + 2))
+                cell_3 = ws.cell(row=r_index, column=(end_c_index + 3))
+                cell_1.border = Border(
+                    bottom=Side(border_style="thin", color="00000000")
+                )
+                cell_2.border = Border(
+                    bottom=Side(border_style="thin", color="00000000")
+                )
+                cell_3.border = props.bottom_right_border
+        elif r_index < 9:
+            cell_1 = ws.cell(row=r_index, column=1)
+            cell_1.border = Border(right=Side(border_style="thin", color="00000000"))
+        elif r_index == 10:
+            if no_total != "t":
+                c_index = 2
+                for i in range(end_c_index + 2):
+                    cell_1 = ws.cell(row=r_index, column=(c_index + i))
+                    cell_1.border = props.bottom_right_border
+            else:
+                c_index = 2
+                for i in range(3):
+                    cell_1 = ws.cell(row=r_index, column=(c_index + i))
+                    cell_1.border = props.bottom_right_border
+
+
+def write_workbook_to_s3(workbook, bucket_name, key):
+    """
+    Writes an OpenPyXL workbook to an s3 bucket
+    :param workbook:
+    :param bucket_name:
+    :param key:
+    :return:
+    """
+    try:
+        print(f"im in write_workbook_to_s3 {workbook}, {bucket_name}, {key}")
+        with io.BytesIO() as output:
+            workbook.save(output)
+            output.seek(0)
+            s3_client.upload_fileobj(output, Bucket=bucket_name, Key=key)
+    except Exception as e:
+        print(f"error {e}")
+
+
+def lambda_handler(event, context):  # NOSONAR
+    """Put togethear the MMS script
+    (1.a) collect the information from the command line, and remove the last report
+    (1) Verify the template location and open up the sheet
+    (2) Fill in the report with the fill_report funcation
+    (3) Write the built report to the directory inputted by the user
+    """
+
+    ######################################
+    # Step 1.a
+
+    date_ranges = {}
+    bucket_name = event["bucket_name"]
+    bucket_prefix = event["bucket_prefix"]
+    template = event["template"]
+
+    rec_cnt_file = event["rec_cnt_file"]
+    new_file_name = event["new_file_name"]  # new cars or new dateDelta.csv
+    used_file_name = event["used_file_name"]  # used cars or used dateDelta.csv
+    output_file_name = event[
+        "output_file_name"
+    ]  # PCNA_Taycan_Female_Driven_January_2024_ARA_TPS_Report.xlsx
+    info_file = event["info_file"]
+
+    extract_customer_name = (
+        lambda info_file: info_file.split("/")[-1].split(".")[0].replace("_", " ")
+    )
+    customer_name = extract_customer_name(info_file)
+
+    one_pre_win = None
+    if s3_client.head_object(Bucket=bucket_name, Key=info_file):
+        report_info = read_csv_from_s3(bucket_name, info_file)
+        for event in report_info:
+            if len(event) > 1:
+                date_range = event[-2].strip()
+                seg = event[-3]
+                one_pre_win = eval(event[-1].strip())
+                date_ranges[seg] = date_range
+    else:
+        print(f"Error: {info_file} is missing or otherwise")
+        return {
+            "statusCode": 400,
+            "body": f"Error: {info_file} is missing or otherwise",
+        }
+
+    ######################################
+    # Step 1
+
+    # Open the excel workbook template
+    try:
+        print("=====open the excel1111=======")
+        object_prefix = f"{template}/{props.MMS_REPORT_TEMPLATE}"
+        response = s3_client.get_object(Bucket=bucket_name, Key=object_prefix)
+        report = openpyxl.load_workbook(filename=io.BytesIO(response["Body"].read()))
+
+        new = report[props.MMS_REPORT_SHEET_NAME_1]
+        used = report[props.MMS_REPORT_SHEET_NAME_2]
+    except Exception as e:
+        print("Error opening Report template. Missing or otherwise.", str(e))
+        sys.exit(1)
+    ######################################
+    # Step 2
+    fill_report(
+        customer_name,
+        bucket_name,
+        new_file_name,
+        rec_cnt_file,
+        date_ranges,
+        new,
+        one_pre_win,
+        bucket_prefix,
+    )
+    print("")
+    fill_report(
+        customer_name,
+        bucket_name,
+        used_file_name,
+        rec_cnt_file,
+        date_ranges,
+        used,
+        one_pre_win,
+        bucket_prefix,
+    )
+    ######################################
+    # Step 3
+    try:
+        # Save file
+        write_workbook_to_s3(report, bucket_name, output_file_name)
+        return {"statusCode": 200, "body": "Report generation completed successfully"}
+
+    except Exception as e:
+        print("Error processing report: ", str(e))
+        return {"statusCode": 500, "body": f"Error processing report {e}"}
