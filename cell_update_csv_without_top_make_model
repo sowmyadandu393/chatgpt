@@ -1,0 +1,307 @@
+# amp_sand_cell_update_csv_make_model-_ss perfectly working till tsp with median 
+
+# -*- coding: utf-8 -*-
+# ================= amp_sand_cell_update_csv_for_ara_dashboard =================
+# Charting F7.. labels + Summary Details D9..D12 + TPS (New/Used):
+#   D11: 0–30, D12: 31–60, D13: 61–90, D14: OTHER, D16: Average, D17: Median
+#   C16 = average of all segment averages, C17 = median of all segment medians
+import csv
+import io
+import re
+import gzip
+import fnmatch
+from urllib.parse import urlparse
+import sys
+import statistics as stats
+import boto3
+from awsglue.utils import getResolvedOptions
+
+# ----------- GLUE ARGS -----------
+args = getResolvedOptions(
+    sys.argv,
+    [
+        "INPUT_COUNTS_BY_SEGMENT",
+        "INPUT_BPS_DATA",
+        "INPUT_TPS_NEW",
+        "INPUT_TPS_USED",
+        "INPUT_TPS_NEW_BASEDELTA",
+        "INPUT_TPS_USED_BASEDELTA",
+        "OUT_URI",
+    ],
+)
+INPUT_COUNTS_BY_SEGMENT   = args["INPUT_COUNTS_BY_SEGMENT"]
+INPUT_BPS_DATA            = args["INPUT_BPS_DATA"]
+INPUT_TPS_NEW             = args["INPUT_TPS_NEW"]
+INPUT_TPS_USED            = args["INPUT_TPS_USED"]
+INPUT_TPS_NEW_BASEDELTA   = args["INPUT_TPS_NEW_BASEDELTA"]
+INPUT_TPS_USED_BASEDELTA  = args["INPUT_TPS_USED_BASEDELTA"]
+OUT_URI                   = args["OUT_URI"]
+
+s3 = boto3.client("s3")
+
+# ----------- HELPERS -----------
+def parse_s3_uri(uri: str):
+    p = urlparse(uri)
+    bucket = p.netloc
+    prefix = p.path.lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    return bucket, prefix
+
+def find_one_data_file(folder_uri: str) -> str:
+    bucket, prefix = parse_s3_uri(folder_uri)
+    patterns = ["part-*", "*.csv", "*.CSV", "*.txt", "*.TXT", "*.gz", "*.GZ"]
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            name = obj["Key"].split("/")[-1]
+            for pat in patterns:
+                if fnmatch.fnmatch(name, pat):
+                    return f"s3://{bucket}/{obj['Key']}"
+    raise FileNotFoundError(f"No data file found under {folder_uri}")
+
+def read_csv_from_s3(s3_uri: str):
+    bucket = urlparse(s3_uri).netloc
+    key = urlparse(s3_uri).path.lstrip("/")
+    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    if key.lower().endswith(".gz"):
+        body = gzip.decompress(body)
+    text = body.decode("utf-8", errors="replace")
+    f = io.StringIO(text)
+    rdr = csv.DictReader(f)
+    rdr.fieldnames = [h.lower() for h in rdr.fieldnames]
+    rows = []
+    for r in rdr:
+        rows.append({(k.lower() if isinstance(k, str) else k): v for k, v in r.items()})
+    return rows
+
+def excel_col(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def column_letter_for_index(i_zero_based: int) -> str:
+    return excel_col(4 + i_zero_based)  # D for 0, E for 1, ...
+
+def format_number(x):
+    try:
+        f = float(x)
+        if abs(f - int(f)) < 1e-9:
+            return str(int(f))
+        return f"{f:.3f}"
+    except Exception:
+        return str(x)
+
+def pretty_segment(seg):
+    return re.sub(r"\s{2,}", " ", (seg or "")).strip()
+
+# ----------- REGEX CLASSIFIER (robust bucket matching) -----------
+_R_RANGE = r"(?:-|–|—|_|to)"
+_RE_0_30  = re.compile(r"\b0\s*%s\s*30\b" % _R_RANGE)
+_RE_31_60 = re.compile(r"\b31\s*%s\s*60\b" % _R_RANGE)
+_RE_61_90 = re.compile(r"\b61\s*%s\s*90\b" % _R_RANGE)
+_RE_AVG   = re.compile(r"\baverage\b", re.IGNORECASE)
+_RE_90P   = re.compile(r"(?:90\+|>\s*90\b)")
+
+def classify_bucket(label: str) -> str:
+    if not label:
+        return "other"
+    s = label.strip().lower()
+    s = re.sub(r"^\s*\d+[\.\)\-]\s*", "", s)  # drop "1. " prefix
+    s = re.sub(r"\s+", " ", s)
+    if _RE_AVG.search(s): return "avg"
+    if _RE_0_30.search(s): return "0_30"
+    if _RE_31_60.search(s): return "31_60"
+    if _RE_61_90.search(s): return "61_90"
+    if _RE_90P.search(s): return "other"
+    if re.search(r"\d+\s*%s\s*\d+" % _R_RANGE, s): return "other"
+    return "other"
+
+# ----------- MEDIAN BY SEGMENT FROM BASE-DELTA -----------
+def compute_median_by_seg(base_rows, seg_key="seg", val_key="date_delta"):
+    buckets = {}
+    for r in base_rows:
+        seg = (r.get(seg_key) or "").strip()
+        val = r.get(val_key)
+        if not seg or val is None or val == "":
+            continue
+        try:
+            v = float(val)
+        except Exception:
+            continue
+        buckets.setdefault(seg, []).append(v)
+    med = {}
+    for seg, vals in buckets.items():
+        vals.sort()
+        n = len(vals)
+        if n == 0:
+            continue
+        if n % 2:
+            med[seg] = float(vals[n//2])
+        else:
+            med[seg] = (vals[n//2 - 1] + vals[n//2]) / 2.0
+    return med
+
+# ----------- BUILDERS -----------
+def build_charting_calculations_labels(segments):
+    return [["Charting Calculations", f"F{7+i}", pretty_segment(seg)]
+            for i, seg in enumerate(segments)]
+
+def build_summary_details(segments, bps):
+    rows = []
+    for i, seg in enumerate(segments):
+        col = column_letter_for_index(i)
+        b = bps.get(seg, {})
+        rows.append(["Summary Details", f"{col}9",  format_number(b.get("record_count", ""))])
+        rows.append(["Summary Details", f"{col}10", format_number(b.get("match_count", ""))])
+        rows.append(["Summary Details", f"{col}11", format_number(b.get("purchase_count", ""))])
+        rows.append(["Summary Details", f"{col}12", format_number(b.get("vehicle_count", ""))])
+    return rows
+
+def build_time_to_purchase_updates(sheet_name, segments, tps_rows):
+    """
+    For each segment (Charting F7 order => D/E/.. columns):
+      D11: 0–30, D12: 31–60, D13: 61–90, D14: OTHER, D16: Average (per segment)
+    Returns (rows, per_segment_averages_float_list)
+    """
+    rows = [[sheet_name, "B14", "90+ Days"]]
+    by_seg = {}
+    for r in tps_rows:
+        seg = (r.get("seg") or "").strip()
+        if seg:
+            by_seg.setdefault(seg, []).append(r)
+
+    def _to_float(x):
+        try: return float(x)
+        except Exception: return 0.0
+
+    segment_avgs = []  # numeric averages (for C16)
+    for i, seg in enumerate(segments):
+        col = column_letter_for_index(i)
+        sums = {"0_30": 0.0, "31_60": 0.0, "61_90": 0.0, "other": 0.0}
+        avg_val = None
+        seen = {"0_30": False, "31_60": False, "61_90": False, "other": False, "avg": False}
+
+        for r in by_seg.get(seg, []):
+            bucket = classify_bucket(r.get("daystopurchase") or "")
+            cnt = _to_float(r.get("cnt", ""))
+            if bucket == "avg":
+                avg_val = cnt; seen["avg"] = True
+            else:
+                sums[bucket] += cnt; seen[bucket] = True
+
+        rows.append([sheet_name, f"{col}11", format_number(sums["0_30"]) if seen["0_30"] else ""])
+        rows.append([sheet_name, f"{col}12", format_number(sums["31_60"]) if seen["31_60"] else ""])
+        rows.append([sheet_name, f"{col}13", format_number(sums["61_90"]) if seen["61_90"] else ""])
+        rows.append([sheet_name, f"{col}14", format_number(sums["other"])  if seen["other"]  else ""])
+        rows.append([sheet_name, f"{col}16", format_number(avg_val)        if seen["avg"]    else ""])
+
+        if seen["avg"]:
+            segment_avgs.append(avg_val)
+
+    return rows, segment_avgs
+
+def build_tps_median_updates(sheet_name, segments, base_rows):
+    """
+    For each segment, compute median(date_delta) and write to D/E/.. row 17.
+    Also returns list of all segment medians to compute C17.
+    """
+    med_by_seg = compute_median_by_seg(base_rows, seg_key="seg", val_key="date_delta")
+    rows = []
+    med_list = []
+    for i, seg in enumerate(segments):
+        col = column_letter_for_index(i)
+        v = med_by_seg.get(seg)
+        if v is not None:
+            rows.append([sheet_name, f"{col}16", format_number(v)])
+            med_list.append(v)
+        else:
+            rows.append([sheet_name, f"{col}16", ""])
+    return rows, med_list
+
+# ----------- MAIN -----------
+def main():
+    # locate & read
+    counts_file = find_one_data_file(INPUT_COUNTS_BY_SEGMENT)
+    bps_file    = find_one_data_file(INPUT_BPS_DATA)
+    new_file    = find_one_data_file(INPUT_TPS_NEW)
+    used_file   = find_one_data_file(INPUT_TPS_USED)
+    new_base    = find_one_data_file(INPUT_TPS_NEW_BASEDELTA)
+    used_base   = find_one_data_file(INPUT_TPS_USED_BASEDELTA)
+
+    counts_rows = read_csv_from_s3(counts_file)
+    bps_rows    = read_csv_from_s3(bps_file)
+    new_rows    = read_csv_from_s3(new_file)
+    used_rows   = read_csv_from_s3(used_file)
+    new_base_rows  = read_csv_from_s3(new_base)
+    used_base_rows = read_csv_from_s3(used_base)
+
+    # segment order (drives Charting F7.. and D/E/.. columns)
+    segments = []
+    for r in counts_rows:
+        s = (r.get("seg") or "").strip()
+        if s:
+            segments.append(s)
+
+    # BPS map
+    bps_map = {}
+    for r in bps_rows:
+        seg = (r.get("seg") or "").strip()
+        if not seg:
+            continue
+        bps_map[seg] = {
+            "record_count":   r.get("record_count"),
+            "match_count":    r.get("match_count"),
+            "purchase_count": r.get("purchase_count"),
+            "vehicle_count":  r.get("vehicle_count"),
+        }
+
+    out = []
+    out.append(["sheet", "cell", "value"])
+
+    # Charting labels + Summary Details
+    out += build_charting_calculations_labels(segments)
+    out += build_summary_details(segments, bps_map)
+
+    # TPS New (rows 11/12/13/14/16) + collect per-segment averages
+    new_rows_out, new_avgs = build_time_to_purchase_updates("Time to Purchase Details - New", segments, new_rows)
+    out += new_rows_out
+    # TPS Used
+    used_rows_out, used_avgs = build_time_to_purchase_updates("Time to Purchase Details - Used", segments, used_rows)
+    out += used_rows_out
+
+    # TPS New median per-segment to row 17, plus list for C17
+    new_meds_rows, new_meds = build_tps_median_updates("Time to Purchase Details - New", segments, new_base_rows)
+    out += new_meds_rows
+    # TPS Used median per-segment to row 17, plus list for C17
+    used_meds_rows, used_meds = build_tps_median_updates("Time to Purchase Details - Used", segments, used_base_rows)
+    out += used_meds_rows
+
+    # C16 = average of segment averages (if any)
+    if new_avgs:
+        out.append(["Time to Purchase Details - New",  "C15", format_number(sum(new_avgs)/len(new_avgs))])
+    if used_avgs:
+        out.append(["Time to Purchase Details - Used", "C15", format_number(sum(used_avgs)/len(used_avgs))])
+
+    # C17 = median of segment medians (if any)
+    if new_meds:
+        out.append(["Time to Purchase Details - New",  "C16", format_number(stats.median(new_meds))])
+    if used_meds:
+        out.append(["Time to Purchase Details - Used", "C16", format_number(stats.median(used_meds))])
+
+    # write CSV to S3
+    csv_buf = io.StringIO()
+    writer = csv.writer(csv_buf, lineterminator="\n")
+    for r in out:
+        writer.writerow(r)
+    data = csv_buf.getvalue().encode("utf-8")
+
+    out_bucket = urlparse(OUT_URI).netloc
+    out_key = urlparse(OUT_URI).path.lstrip("/")
+    boto3.client("s3").put_object(Bucket=out_bucket, Key=out_key, Body=data)
+    print(f"✅ Wrote {len(out)-1} updates to {OUT_URI}")
+
+if __name__ == "__main__":
+    main()
