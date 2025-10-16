@@ -1,0 +1,312 @@
+# amp_sand_dashboard_ara_filling_values_ttp_only.py
+# Updates ONLY "Time to Purchase Details - New" and "Time to Purchase Details - Used"
+# from a CSV with columns: sheet,cell,value
+
+import io, zipfile, boto3, re, os, shutil, time, csv, sys
+from pathlib import Path
+import xml.etree.ElementTree as ET
+from urllib.parse import urlparse
+from awsglue.utils import getResolvedOptions
+
+# ---------- Glue args ----------
+REQUIRED = ["BUCKET_IN", "KEY_IN", "BUCKET_OUT", "KEY_OUT", "BUCKET_CSV", "KEY_CSV", "CLIENT"]
+args = getResolvedOptions(sys.argv, REQUIRED)
+
+def _clean(v): return v.strip().strip('"').strip("'") if isinstance(v, str) else v
+BUCKET_IN  = _clean(args["BUCKET_IN"]);  KEY_IN  = _clean(args["KEY_IN"])
+BUCKET_OUT = _clean(args["BUCKET_OUT"]); KEY_OUT = _clean(args["KEY_OUT"])
+BUCKET_CSV = _clean(args["BUCKET_CSV"]); KEY_CSV = _clean(args["KEY_CSV"])
+CLIENT     = _clean(args["CLIENT"])  # unused, kept for compatibility
+
+def _normalize_bucket_key(bucket, key):
+    if isinstance(key, str) and key.lower().startswith("s3://"):
+        p = urlparse(key); return p.netloc, p.path.lstrip("/")
+    return bucket, key.lstrip("/") if isinstance(key, str) else key
+
+BUCKET_IN,  KEY_IN  = _normalize_bucket_key(BUCKET_IN,  KEY_IN)
+BUCKET_OUT, KEY_OUT = _normalize_bucket_key(BUCKET_OUT, KEY_OUT)
+BUCKET_CSV, KEY_CSV = _normalize_bucket_key(BUCKET_CSV, KEY_CSV)
+
+# ===== Namespaces =====
+NS_MAIN  = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+NS_REL   = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+NS_MC    = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+NS_X14AC = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac"
+NS_XR    = "http://schemas.openxmlformats.org/spreadsheetml/2014/revision"
+NS_XR2   = "http://schemas.openxmlformats.org/spreadsheetml/2015/revision2"
+NS_XR3   = "http://schemas.openxmlformats.org/spreadsheetml/2016/revision3"
+XML_NS   = "http://www.w3.org/XML/1998/namespace"
+
+ET.register_namespace("", NS_MAIN)
+ET.register_namespace("r", NS_REL)
+ET.register_namespace("mc", NS_MC)
+ET.register_namespace("x14ac", NS_X14AC)
+ET.register_namespace("xr", NS_XR)
+ET.register_namespace("xr2", NS_XR2)
+ET.register_namespace("xr3", NS_XR3)
+
+NS = "{%s}" % NS_MAIN
+A1_RE = re.compile(r"^([A-Za-z]{1,3})(\d+)$")
+_ILLEGAL_XML_RE = re.compile(u"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+def sanitize(s):
+    try: return _ILLEGAL_XML_RE.sub("", s or "")
+    except TypeError: return s
+
+# ===== ZIP helpers =====
+def unzip_bytes(data: bytes, out_dir: Path):
+    if out_dir.exists(): shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(data)) as z: z.extractall(out_dir)
+
+def rezip_dir(root: Path) -> bytes:
+    MIN_DOS_TIME = 315532800
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+        for base, _, files in os.walk(root):
+            for f in sorted(files):
+                ap = Path(base)/f; rp = ap.relative_to(root).as_posix()
+                zi = zipfile.ZipInfo(rp)
+                try: mtime = max(int(ap.stat().st_mtime), MIN_DOS_TIME)
+                except Exception: mtime = MIN_DOS_TIME
+                zi.date_time = time.localtime(mtime)[:6]
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                with open(ap, "rb") as fh: z.writestr(zi, fh.read())
+    buf.seek(0); return buf.getvalue()
+
+def remove_calc_chain(root: Path):
+    chain = root / "xl/calcChain.xml"
+    if chain.exists(): chain.unlink()
+    rels = root / "xl/_rels/workbook.xml.rels"
+    if rels.exists():
+        t = ET.parse(rels); r = t.getroot(); changed = False
+        for rel in list(r):
+            if rel.attrib.get("Type","").endswith("/calcChain"):
+                r.remove(rel); changed = True
+        if changed: t.write(rels, encoding="utf-8", xml_declaration=True)
+
+# ===== workbook helpers =====
+def workbook_rel_map(root: Path):
+    rels_root = ET.parse(root / "xl/_rels/workbook.xml.rels").getroot()
+    rid2target = {}
+    for rel in rels_root:
+        if rel.tag.endswith("Relationship"):
+            rid2target[rel.attrib["Id"]] = rel.attrib["Target"].lstrip("/")
+    return rid2target
+
+def find_sheet_xml_by_name(root: Path, sheet_name: str) -> Path:
+    wb = ET.parse(root / "xl/workbook.xml").getroot()
+    rid2target = workbook_rel_map(root)
+    for sh in wb.findall(f".//{NS}sheets/{NS}sheet"):
+        if sh.attrib.get("name") == sheet_name:
+            rid = sh.attrib[f"{{{NS_REL}}}id"]
+            return (root / "xl" / rid2target[rid]).resolve()
+    raise FileNotFoundError(sheet_name)
+
+def ensure_row(sheet_root, rownum: str):
+    sd = sheet_root.find(f".//{NS}sheetData")
+    if sd is None: sd = ET.SubElement(sheet_root, f"{NS}sheetData")
+    row = sd.find(f"{NS}row[@r='{rownum}']")
+    if row is None: row = ET.SubElement(sd, f"{NS}row", {"r": str(rownum)})
+    return row
+
+def find_cell(sheet_root, a1_ref: str):
+    m = A1_RE.match(a1_ref)
+    if not m: return None
+    row = sheet_root.find(f".//{NS}sheetData/{NS}row[@r='%s']" % m.group(2))
+    if row is None: return None
+    for c in row.findall(f"{NS}c"):
+        if c.attrib.get("r") == a1_ref: return c
+    return None
+
+def ensure_cell(sheet_root, a1_ref: str):
+    m = A1_RE.match(a1_ref)
+    row = ensure_row(sheet_root, m.group(2))
+    c = find_cell(sheet_root, a1_ref)
+    if c is None: c = ET.SubElement(row, f"{NS}c", {"r": a1_ref})
+    return c, row
+
+def col_to_num(col: str):
+    n = 0
+    for ch in col.upper(): n = n*26 + (ord(ch)-64)
+    return n
+
+def num_to_col(n: int):
+    s = ""
+    while n: n, r = divmod(n-1, 26); s = chr(65+r)+s
+    return s
+
+def sort_row_cells(row):
+    cells = row.findall(f"{NS}c")
+    def key(c):
+        m = A1_RE.match(c.attrib.get("r","A1"))
+        return col_to_num(m.group(1)) if m else 0
+    for c in cells: row.remove(c)
+    for c in sorted(cells, key=key): row.append(c)
+
+def update_row_spans(row):
+    cells = row.findall(f"{NS}c")
+    if not cells: row.attrib.pop("spans", None); return
+    cols = []
+    for c in cells:
+        m = A1_RE.match(c.attrib.get("r","A1"))
+        if m: cols.append(col_to_num(m.group(1)))
+    row.attrib["spans"] = f"{min(cols)}:{max(cols)}"
+
+def expand_dimension_to_include(sheet_root, a1_ref: str):
+    dim = sheet_root.find(f".//{NS}dimension")
+    m = A1_RE.match(a1_ref); tgt_col, tgt_row = m.group(1).upper(), int(m.group(2))
+    if dim is None:
+        ET.SubElement(sheet_root, f"{NS}dimension", {"ref": f"A1:{tgt_col}{tgt_row}"})
+        return
+    end = dim.attrib.get("ref", "A1:A1").split(":")[-1]
+    m2 = A1_RE.match(end)
+    if not m2:
+        dim.attrib["ref"] = f"A1:{tgt_col}{tgt_row}"; return
+    cur_c, cur_r = m2.group(1).upper(), int(m2.group(2))
+    new_c = max(col_to_num(cur_c), col_to_num(tgt_col))
+    new_r = max(cur_r, tgt_row)
+    dim.attrib["ref"] = f"A1:{num_to_col(new_c)}{new_r}"
+
+# ===== sharedStrings =====
+def load_or_create_sst(root: Path):
+    sst_path = root / "xl/sharedStrings.xml"
+    if sst_path.exists():
+        tree = ET.parse(sst_path); sst = tree.getroot()
+        return tree, sst, sst_path
+    sst = ET.Element(f"{NS}sst", {"count":"0","uniqueCount":"0","xmlns":NS_MAIN})
+    tree = ET.ElementTree(sst)
+    tree.write(sst_path, encoding="utf-8", xml_declaration=True)
+    return tree, sst, sst_path
+
+def build_sst_index(sst_root):
+    idx = {}
+    for i, si in enumerate(sst_root.findall(f"{NS}si")):
+        t = si.find(f"{NS}t")
+        text = t.text if (t is not None and t.text is not None) else "".join((tt.text or "") for tt in si.findall(f".//{NS}t"))
+        idx[text] = i
+    count = int(sst_root.attrib.get("count", str(len(idx))))
+    uniq  = int(sst_root.attrib.get("uniqueCount", str(len(idx))))
+    return idx, count, uniq
+
+def sst_get_or_add(sst_root, text: str):
+    text = sanitize(text)
+    index_map, count, uniq = build_sst_index(sst_root)
+    if text in index_map:
+        sst_root.attrib["count"] = str(count + 1)
+        return index_map[text]
+    si = ET.SubElement(sst_root, f"{NS}si")
+    t  = ET.SubElement(si, f"{NS}t")
+    t.set(f"{{{XML_NS}}}space", "preserve")
+    t.text = text
+    sst_root.attrib["count"] = str(count + 1)
+    sst_root.attrib["uniqueCount"] = str(uniq + 1)
+    return len(index_map)
+
+# ===== setters =====
+def set_text_via_sst(sheet_root, a1_ref: str, text: str, sst_root):
+    c, row = ensure_cell(sheet_root, a1_ref)
+    prev_style = c.attrib.get("s")
+    for tag in (f"{NS}v", f"{NS}is", f"{NS}f"):
+        el = c.find(tag)
+        if el is not None: c.remove(el)
+    idx = sst_get_or_add(sst_root, text)
+    c.attrib["t"] = "s"
+    ET.SubElement(c, f"{NS}v").text = str(idx)
+    if prev_style is not None: c.attrib["s"] = prev_style
+    sort_row_cells(row); update_row_spans(row); expand_dimension_to_include(sheet_root, a1_ref)
+
+def set_number_value(sheet_root, a1_ref: str, num_str: str):
+    c, row = ensure_cell(sheet_root, a1_ref)
+    prev_style = c.attrib.get("s")
+    for tag in (f"{NS}v", f"{NS}is", f"{NS}f"):
+        el = c.find(tag)
+        if el is not None: c.remove(el)
+    ET.SubElement(c, f"{NS}v").text = str(num_str)
+    c.attrib.pop("t", None)
+    if prev_style is not None: c.attrib["s"] = prev_style
+    sort_row_cells(row); update_row_spans(row); expand_dimension_to_include(sheet_root, a1_ref)
+
+def set_formula(sheet_root, a1_ref: str, formula_text: str):
+    c, row = ensure_cell(sheet_root, a1_ref)
+    prev_style = c.attrib.get("s")
+    for tag in (f"{NS}v", f"{NS}is", f"{NS}f"):
+        el = c.find(tag)
+        if el is not None: c.remove(el)
+    ET.SubElement(c, f"{NS}f").text = formula_text  # without '='
+    if prev_style is not None: c.attrib["s"] = prev_style
+    sort_row_cells(row); update_row_spans(row); expand_dimension_to_include(sheet_root, a1_ref)
+
+# ===== apply: ONLY the two Time-to-Purchase sheets =====
+TARGET_SHEETS = {
+    "Time to Purchase Details - New",
+    "Time to Purchase Details - Used",
+}
+
+def apply_ttp_updates(work_root: Path, csv_rows: list, sst_root):
+    counts = {name: {"total":0, "updated":0} for name in TARGET_SHEETS}
+
+    for i, row in enumerate(csv_rows, start=1):
+        sheet = (row.get("sheet") or row.get("Sheet") or row.get("SHEET") or "").strip()
+        if sheet not in TARGET_SHEETS:
+            continue
+        cell  = (row.get("cell")  or row.get("Cell")  or row.get("CELL")  or "").strip().upper()
+        value = (row.get("value") or row.get("Value") or row.get("VALUE") or "")
+        if not cell:
+            print(f"Row {i}: missing cell for '{sheet}' -> skip"); continue
+
+        counts[sheet]["total"] += 1
+
+        try:
+            s_path = find_sheet_xml_by_name(work_root, sheet)
+        except FileNotFoundError:
+            print(f"ERROR: sheet '{sheet}' not found in workbook"); continue
+
+        tree = ET.parse(s_path); root = tree.getroot()
+        v = (value or "").strip()
+
+        if v.startswith("="):
+            set_formula(root, cell, v[1:]); kind = "FORMULA"
+        else:
+            is_num = False
+            try:
+                float(v.replace(',', '')); is_num = True
+            except Exception:
+                is_num = False
+            if is_num:
+                set_number_value(root, cell, v.replace(',', '')); kind = "NUMBER"
+            else:
+                set_text_via_sst(root, cell, v, sst_root); kind = "TEXT"
+
+        tree.write(s_path, encoding="utf-8", xml_declaration=True)
+        counts[sheet]["updated"] += 1
+        print(f"OK [{counts[sheet]['updated']}/{counts[sheet]['total']}]: {sheet}!{cell} <- {kind}({value})")
+
+    for name in TARGET_SHEETS:
+        print(f"TTP DONE ({name}): {counts[name]['updated']}/{counts[name]['total']} updated")
+
+# ===== MAIN =====
+def main():
+    s3 = boto3.client("s3")
+
+    wb_buf = io.BytesIO(); s3.download_fileobj(BUCKET_IN, KEY_IN, wb_buf); wb_buf.seek(0)
+    csv_buf = io.BytesIO(); s3.download_fileobj(BUCKET_CSV, KEY_CSV, csv_buf); csv_buf.seek(0)
+
+    reader = csv.DictReader(io.TextIOWrapper(csv_buf, encoding="utf-8"))
+    rows = list(reader); print(f"CSV rows (all sheets): {len(rows)}")
+
+    work = Path("/tmp/xlsx_ttp_only")
+    unzip_bytes(wb_buf.getvalue(), work)
+    remove_calc_chain(work)
+
+    sst_tree, sst_root, sst_path = load_or_create_sst(work)
+
+    apply_ttp_updates(work, rows, sst_root)
+    sst_tree.write(sst_path, encoding="utf-8", xml_declaration=True)
+
+    out = rezip_dir(work)
+    s3.upload_fileobj(io.BytesIO(out), BUCKET_OUT, KEY_OUT)
+    print(f"SUCCESS → s3://{BUCKET_OUT}/{KEY_OUT}")
+
+if __name__ == "__main__":
+    main()
