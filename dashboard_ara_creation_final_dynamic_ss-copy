@@ -1,78 +1,78 @@
-# amp_sand_dashboard_ara_creation_make_model_ss
 # -*- coding: utf-8 -*-
 """
-Build Summary columns based on SELECTION_COUNT, adjust charts and formulas,
-and clean Top Make/Model sheets.
+amp_sand_dasboard_make,model_dynamic_b6_c6_ss with row-19 replication per-sheet
 
-What this script does:
-- Grows/Shrinks Charting Calculations!F7.. based on SELECTION_COUNT (labels only)
-- Builds Summary Details / TTP New / TTP Used columns D..(last) with inferred formulas
-- Updates totals and conditional formatting
-- Patches embedded chart ranges to the new last summary column
-- Sets Charting Calculations B19/C19/D19 to point at 'Top Make, Model Details - New'!B22/C22/D22
-- **Clears everything from B12 onward** in:
-    - 'Top Make, Model Details - New'
-    - 'Top Make, Model Details - Used'
-
-Plus:
-- Mirrors rows 15 & 16 (columns D..last) Used → New (formulas & styles)
-- Deep-clones C15 & C16 from Used → New (exact content + style)
+What this version does:
+- Bulk copy (shift) is limited to SOURCE rows B12..B18 only. Row 19 is NOT bulk-copied.
+- Apply B8 style to C19,D19,E19,F19,G19,H19 and B20,B21 (per sheet) BEFORE mirroring.
+- Apply "Summary Details"!B19 style to all written cells with row <= 18.
+- Force 0.00% number format for D,E,G,H for rows >= 21.
+- Replicate SOURCE row 19 (B..H) into DEST rows starting at 22.
+  **Counts are controlled PER SHEET** via ROW_REPEAT_COUNT_PER_SHEET.
+- Mirror F:G:H across selection blocks (I:K, L:N, …) — styles/values flow automatically.
+- Remove calcChain to avoid the Excel “We found a problem with some content” prompt.
 """
 
-import csv
-import io
-import os
-import re
-import shutil
-import sys
-import time
-import xml.etree.ElementTree as ET
-import zipfile
+import io, csv, zipfile, boto3, re, os, shutil, time
 from pathlib import Path
-from statistics import median
-from datetime import datetime, timezone, timedelta
+import xml.etree.ElementTree as ET
 
-import boto3
-from awsglue.utils import getResolvedOptions
+# ------------ S3 ------------
+SRC_BUCKET    = "amp-caspex-sowmya"
+SRC_KEY       = "dashboard_test/Updated ARA Reporting Mock Ups_make_model_one_ss.xlsx"
 
-# ========== GLUE ARGS ==========
-args = getResolvedOptions(
-    sys.argv,
-    [
-        "BUCKET_IN",
-        "KEY_IN",
-        "BUCKET_OUT",
-        "KEY_OUT",
-        "SELECTION_COUNT",
-    ],
-)
-BUCKET_IN = args["BUCKET_IN"]
-KEY_IN = args["KEY_IN"]
-BUCKET_OUT = args["BUCKET_OUT"]
-KEY_OUT = args["KEY_OUT"]
-SELECTION_COUNT = int(args["SELECTION_COUNT"])
+DST_IN_BUCKET = "amp-caspex-sowmya"
+DST_IN_KEY    = "dashboard-output/updated_file.xlsx"
 
-# ========== CONFIG ==========
-SHEET_NAME_CHART = "Charting Calculations"
-TARGET_SUMMARY_SHEETS = [
-    "Summary Details",
-    "Time to Purchase Details - New",
-    "Time to Purchase Details - Used",
+OUT_BUCKET    = "amp-caspex-sowmya"
+OUT_KEY       = "dashboard-output/sanitized_debug_filled.xlsx"
+
+CSV_BUCKET    = OUT_BUCKET
+CSV_KEY       = "dashboard-output/mm_formulas_dump_with_style.csv"
+
+# ------------ SHEETS / RANGE ---------------------
+SHEETS = [
+    "Top Make, Model Details - New",
+    "Top Make, Model Details - Used",
 ]
-APPEND_LABELS = [
-    "toyato", "hamlin", "series C", "series D", "series E",
-    "series F", "series G", "series H", "series I", "series J",
-    "series K", "series L", "series M", "series N",
-]
-FIRST_ROW = 8
-LAST_ROW = 16
-BASE_SUMMARY_FIRST_COL = "D"   # maps to Chart F7
-TEMPLATE_LAST_COL      = "M"
-CHART_COL              = "F"
-USED_SHEET = "Top Make, Model Details - Used"
-NEW_SHEET  = "Top Make, Model Details - New"
 
-# ===== Namespaces =====
+SRC_START_COL_LETTER = "B"
+SRC_START_ROW        = 12            # read from here in source
+DST_START_ROW        = 15            # write here in destination (B15..)
+ROW_OFFSET           = DST_START_ROW - SRC_START_ROW  # +3 shift
+
+# Limit bulk dump: do NOT copy anything from source row >= 19 (we handle 19 via replication)
+MAX_SRC_ROW_FOR_SHIFT = 18
+
+# Mirroring config
+SELECTION_COUNT    = 0               # supports 0..13 (0 means: NO MIRRORING)
+MIRROR_START_ROW   = 14              # mirror F:G:H from row 14 (covers 14..19 too)
+
+# ----------- NEW: per-sheet row replication counts -----------
+ROW_REPEAT_COUNT_PER_SHEET = {
+    "Top Make, Model Details - New": 11,   # example
+    "Top Make, Model Details - Used": 6,  # example
+}
+DEFAULT_ROW_REPEAT_COUNT = 0
+
+# Percent-format enforcement
+PERCENT_TWO_DEC_COLS = {"D", "E", "G", "H"}
+PERCENT_FROM_ROW     = 21            # apply 0.00% only from row 21+
+
+# Style references
+DATA_STYLE_REF_PER_SHEET = {
+    "Top Make, Model Details - New":  "C8",
+    "Top Make, Model Details - Used": "C8",
+}
+EMPTY_STYLE_SHEET = "Time to Purchase Details - New"
+EMPTY_STYLE_CELL  = "D10"
+
+# Apply Summary Details style up to (and including) row 18
+SUMMARY_SHEET_NAME = "Summary Details"
+SUMMARY_STYLE_REF  = "B19"
+SUMMARY_STYLE_APPLY_UNTIL_ROW = 18  # inclusive
+
+# ------------ Namespaces -------------------------
 NS_MAIN  = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NS_REL   = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 NS_MC    = "http://schemas.openxmlformats.org/markup-compatibility/2006"
@@ -81,18 +81,18 @@ NS_XR    = "http://schemas.openxmlformats.org/spreadsheetml/2014/revision"
 NS_XR2   = "http://schemas.openxmlformats.org/office/spreadsheetml/2015/revision2"
 NS_XR3   = "http://schemas.openxmlformats.org/office/spreadsheetml/2016/revision3"
 
-ET.register_namespace("",      NS_MAIN)
-ET.register_namespace("r",     NS_REL)
-ET.register_namespace("mc",    NS_MC)
+ET.register_namespace("", NS_MAIN)
+ET.register_namespace("r", NS_REL)
+ET.register_namespace("mc", NS_MC)
 ET.register_namespace("x14ac", NS_X14AC)
-ET.register_namespace("xr",    NS_XR)
-ET.register_namespace("xr2",   NS_XR2)
-ET.register_namespace("xr3",   NS_XR3)
-NS = "{%s}" % NS_MAIN
+ET.register_namespace("xr", NS_XR)
+ET.register_namespace("xr2", NS_XR2)
+ET.register_namespace("xr3", NS_XR3)
 
+NS = "{%s}" % NS_MAIN
 A1_RE = re.compile(r"^([A-Z]{1,3})(\d+)$")
 
-# ---------- zip helpers ----------
+# ------------- Zip helpers -----------------------
 def unzip_bytes(data: bytes, out_dir: Path):
     if out_dir.exists():
         shutil.rmtree(out_dir)
@@ -133,7 +133,7 @@ def remove_calc_chain(root: Path):
         if changed:
             t.write(rels, encoding="utf-8", xml_declaration=True)
 
-# ---------- workbook helpers ----------
+# ------------- Workbook helpers ------------------
 def find_sheet_xml_by_name(root: Path, sheet_name: str) -> Path:
     wb = ET.parse(root / "xl/workbook.xml").getroot()
     rels_root = ET.parse(root / "xl/_rels/workbook.xml.rels").getroot()
@@ -148,7 +148,20 @@ def find_sheet_xml_by_name(root: Path, sheet_name: str) -> Path:
             return (root / "xl" / target).resolve()
     raise FileNotFoundError(sheet_name)
 
-# ---------- cell/row/col utils ----------
+def load_shared_strings(root: Path):
+    sst_path = root / "xl/sharedStrings.xml"
+    if not sst_path.exists():
+        return []
+    sst_root = ET.parse(sst_path).getroot()
+    out = []
+    for si in sst_root.findall(f".//{NS}si"):
+        parts = []
+        for t in si.findall(f".//{NS}t"):
+            parts.append(t.text or "")
+        out.append("".join(parts))
+    return out
+
+# ------------- Cell helpers ----------------------
 def col_to_num(col: str) -> int:
     n = 0
     for ch in col.upper():
@@ -162,74 +175,45 @@ def num_to_col(n: int) -> str:
         s = chr(65 + r) + s
     return s
 
-def get_row(sheet_root, rownum: str):
-    return sheet_root.find(f".//{NS}sheetData/{NS}row[@r='{rownum}']")
+def get_row(sheet_root, rnum: int):
+    return sheet_root.find(f".//{NS}sheetData/{NS}row[@r='{rnum}']")
 
-def ensure_row(sheet_root, rownum: str):
+def ensure_row(sheet_root, rnum: int):
     sheetData = sheet_root.find(f".//{NS}sheetData")
     if sheetData is None:
         sheetData = ET.SubElement(sheet_root, f"{NS}sheetData")
-    row = sheetData.find(f"{NS}row[@r='{rownum}']")
+    row = sheetData.find(f"{NS}row[@r='{rnum}']")
     if row is None:
-        row = ET.SubElement(sheetData, f"{NS}row", {"r": str(rownum)})
+        row = ET.SubElement(sheetData, f"{NS}row", {"r": str(rnum)})
     return row
 
-def find_cell(sheet_root, a1_ref: str):
-    m = A1_RE.match(a1_ref)
-    if not m:
-        return None
-    row = get_row(sheet_root, m.group(2))
-    if row is None:
-        return None
+def find_cell(sheet_root, a1: str):
+    m = A1_RE.match(a1)
+    if not m: return None
+    row = get_row(sheet_root, int(m.group(2)))
+    if row is None: return None
     for c in row.findall(f"{NS}c"):
-        if c.attrib.get("r") == a1_ref:
+        if c.attrib.get("r") == a1:
             return c
     return None
 
-def ensure_cell(sheet_root, a1_ref: str):
-    m = A1_RE.match(a1_ref)
-    row = ensure_row(sheet_root, m.group(2))
-    c = find_cell(sheet_root, a1_ref)
-    if c is None:
-        c = ET.SubElement(row, f"{NS}c", {"r": a1_ref})
-    return c, row
-
-def remove_cell(sheet_root, a1_ref: str):
-    m = A1_RE.match(a1_ref)
-    if not m:
-        return
-    row = get_row(sheet_root, m.group(2))
-    if row is None:
-        return
-    for c in row.findall(f"{NS}c"):
-        if c.attrib.get("r") == a1_ref:
-            row.remove(c)
-            sort_row_cells(row)
-            update_row_spans(row)
-            return
-
 def sort_row_cells(row):
     cells = row.findall(f"{NS}c")
-    if not cells:
-        return
+    if not cells: return
     def key(c):
-        m = A1_RE.match(c.attrib.get("r", "A1"))
+        m = A1_RE.match(c.attrib.get("r","A1"))
         return col_to_num(m.group(1)) if m else 0
-    for c in cells:
-        row.remove(c)
-    for c in sorted(cells, key=key):
-        row.append(c)
+    for c in cells: row.remove(c)
+    for c in sorted(cells, key=key): row.append(c)
 
 def update_row_spans(row):
     cells = row.findall(f"{NS}c")
     if not cells:
-        row.attrib.pop("spans", None)
-        return
+        row.attrib.pop("spans", None); return
     cols = []
     for c in cells:
-        m = A1_RE.match(c.attrib.get("r", "A1"))
-        if m:
-            cols.append(col_to_num(m.group(1)))
+        m = A1_RE.match(c.attrib.get("r","A1"))
+        if m: cols.append(col_to_num(m.group(1)))
     if cols:
         row.attrib["spans"] = f"{min(cols)}:{max(cols)}"
 
@@ -238,7 +222,7 @@ def expand_dimension_to_include(sheet_root, col_letter: str, rownum: int):
     if dim is None:
         ET.SubElement(sheet_root, f"{NS}dimension", {"ref": f"A1:{col_letter}{rownum}"})
         return
-    ref = dim.attrib.get("ref", "A1:A1")
+    ref = dim.attrib.get("ref","A1:A1")
     end = ref.split(":")[-1]
     m_end = A1_RE.match(end)
     if not m_end:
@@ -249,572 +233,501 @@ def expand_dimension_to_include(sheet_root, col_letter: str, rownum: int):
     new_row = max(cur_row, rownum)
     dim.attrib["ref"] = f"A1:{num_to_col(new_col_idx)}{new_row}"
 
-def shrink_dimension_to_col(sheet_root, last_col: str, last_row: int):
-    dim = sheet_root.find(f".//{NS}dimension")
-    if dim is None:
-        ET.SubElement(sheet_root, f"{NS}dimension", {"ref": f"A1:{last_col}{last_row}"})
-    else:
-        dim.attrib["ref"] = f"A1:{last_col}{last_row}"
-
-# ---------- setters ----------
-def set_number_value(sheet_root, a1_ref: str, num_value: str, style_donor_a1: str = None):
-    c, row = ensure_cell(sheet_root, a1_ref)
-    for tag in (f"{NS}v", f"{NS}is", f"{NS}f"):
-        el = c.find(tag)
-        if el is not None:
-            c.remove(el)
-    v = ET.SubElement(c, f"{NS}v")
-    v.text = str(num_value)
-    c.attrib.pop("t", None)
-    if style_donor_a1:
-        donor = find_cell(sheet_root, style_donor_a1)
-        if donor is not None and "s" in donor.attrib:
-            c.attrib["s"] = donor.attrib["s"]
-    sort_row_cells(row)
-    update_row_spans(row)
-
-def set_formula(sheet_root, a1_ref: str, formula_text: str, style_donor_a1: str = None):
-    if not formula_text.startswith("="):
-        formula_text = "=" + formula_text
-    c, row = ensure_cell(sheet_root, a1_ref)
-    for tag in (f"{NS}v", f"{NS}is", f"{NS}f"):
-        el = c.find(tag)
-        if el is not None:
-            c.remove(el)
-    ET.SubElement(c, f"{NS}f").text = formula_text
-    if style_donor_a1:
-        donor = find_cell(sheet_root, style_donor_a1)
-        if donor is not None and "s" in donor.attrib:
-            c.attrib["s"] = donor.attrib["s"]
-    sort_row_cells(row)
-    update_row_spans(row)
-
-def set_inline_text(sheet_root, a1_ref: str, text_value: str, style_donor_a1: str = None):
-    c, row = ensure_cell(sheet_root, a1_ref)
-    for tag in (f"{NS}v", f"{NS}is", f"{NS}f"):
-        el = c.find(tag)
-        if el is not None:
-            c.remove(el)
-    c.attrib["t"] = "inlineStr"
-    is_el = ET.SubElement(c, f"{NS}is")
-    ET.SubElement(is_el, f"{NS}t").text = text_value
-    if style_donor_a1:
-        donor = find_cell(sheet_root, style_donor_a1)
-        if donor is not None and "s" in donor.attrib:
-            c.attrib["s"] = donor.attrib["s"]
-    sort_row_cells(row)
-    update_row_spans(row)
-
-# ---------- formula inference helpers ----------
-A1_TOKEN_WITH_SHEET = re.compile(
-    r"(?<![A-Z0-9_.])"
-    r"(?:(?P<sheet>'[^']+'|[A-Za-z0-9_ ]+)\!)?"
-    r"(?P<coldollar>\$?)(?P<col>[A-Z]{1,3})(?P<rowdollar>\$?)(?P<row>\d+)"
-)
-def _strip_quotes(s: str) -> str:
-    return s[1:-1] if s and s.startswith("'") and s.endswith("'") else s
-
-def shift_same_sheet_col(formula: str, current_sheet: str, from_col: str, to_col: str) -> str:
-    if not formula:
-        return formula
-    def repl(m):
-        sheet = m.group("sheet")
-        col = m.group("col")
-        if col != from_col:
-            return m.group(0)
-        if sheet is not None and _strip_quotes(sheet) != current_sheet:
-            return m.group(0)
-        if m.group("coldollar") == "$":
-            return m.group(0)
-        return f"{'' if sheet is None else sheet + '!'}{m.group('coldollar')}{to_col}{m.group('rowdollar')}{m.group('row')}"
-    return A1_TOKEN_WITH_SHEET.sub(repl, formula)
-
-def extract_chart_F_rows(formula: str, chart_sheet: str):
-    if not formula: return []
-    sheet_esc = re.escape(chart_sheet)
-    SHEET = rf"(?:'{sheet_esc}'|{sheet_esc})"
-    pat = re.compile(rf"({SHEET}\!)\s*\$?F(\$?)(\d+)\b")
-    rows = []
-    for m in pat.finditer(formula):
-        if m.group(2) == "$":  # row-absolute
-            continue
-        rows.append(int(m.group(3)))
-    return rows
-
-def bump_chart_F_rows_by(formula: str, chart_sheet: str, bump: int) -> str:
-    if not formula or bump == 0: return formula
-    sheet_esc = re.escape(chart_sheet)
-    SHEET = rf"(?:'{sheet_esc}'|{sheet_esc})"
-    pat = re.compile(rf"({SHEET}\!)\s*(\$?)F(\$?)(\d+)\b")
-    def repl(m):
-        if m.group(3) == "$":
-            return m.group(0)
-        return f"{m.group(1)}{m.group(2)}F{m.group(3)}{int(m.group(4)) + bump}"
-    return pat.sub(repl, formula)
-
-def infer_delta_from_L_vs_M(fL: str, fM: str, chart_sheet: str, default: int = 1) -> int:
-    rows_L = sorted(extract_chart_F_rows(fL, chart_sheet)) if fL else []
-    rows_M = sorted(extract_chart_F_rows(fM, chart_sheet)) if fM else []
-    if rows_L and rows_M:
-        diffs = [m - l for (l, m) in zip(rows_L, rows_M)]
-        if diffs:
-            try:
-                return int(median(diffs))
-            except Exception:
-                return diffs[0]
-    return default
-
-def transform_formula_using_pattern(base_formula: str, sheet_name: str,
-                                    from_col: str, to_col: str,
-                                    chart_sheet: str, bump_rows_by: int) -> str:
-    s = shift_same_sheet_col(base_formula, sheet_name, from_col, to_col)
-    s = bump_chart_F_rows_by(s, chart_sheet, bump_rows_by)
-    return s
-
-# ---------- chart helpers ----------
-def find_last_used_row_in_chart_col(sheet_root, col_letter: str) -> int:
-    sd = sheet_root.find(f".//{NS}sheetData")
-    if sd is None: return 0
-    last = 0
-    for row in sd.findall(f"{NS}row"):
-        rnum = int(row.attrib.get("r", "0"))
-        ref = f"{col_letter}{rnum}"
-        for c in row.findall(f"{NS}c"):
-            if c.attrib.get("r") != ref:
-                continue
-            if ((c.find(f"{NS}v") is not None) or
-                (c.find(f"{NS}is") is not None) or
-                (c.find(f"{NS}f") is not None)):
-                last = max(last, rnum)
-            break
-    return last
-
-# ---------- conditional formatting (sqref widening) ----------
-A1_OR_RANGE_RE = re.compile(r"([A-Z]{1,3})(\d+)(?::([A-Z]{1,3})(\d+))?$")
-def _token_rows(token: str):
-    m = A1_OR_RANGE_RE.fullmatch(token)
-    if not m: return None
-    c1, r1, c2, r2 = m.group(1), int(m.group(2)), m.group(3), m.group(4)
-    if c2 is None:
-        return (False, c1, r1, None, None)
-    return (True, c1, r1, c2, int(r2))
-def _make_range(col_start: str, row: int, col_end: str):
-    return f"{col_start}{row}:{col_end}{row}"
-def expand_conditional_formatting_for_rows(sheet_root, start_col_letter: str,
-                                           end_col_letter: str, rows_to_cover: list):
-    target_rows = set(rows_to_cover)
-    changed_total = 0
-    for cf in sheet_root.findall(f".//{NS}conditionalFormatting"):
-        sqref = cf.attrib.get("sqref")
-        if not sqref: continue
-        tokens, new_tokens, changed_here = sqref.split(), [], 0
-        for tok in tokens:
-            p = _token_rows(tok)
-            if not p:
-                new_tokens.append(tok); continue
-            is_range, c1, r1, c2, r2 = p
-            if not is_range:
-                if r1 in target_rows:
-                    new_tokens.append(_make_range(start_col_letter, r1, end_col_letter))
-                    changed_here += 1
-                else:
-                    new_tokens.append(tok)
-            else:
-                if r1 == r2 and r1 in target_rows:
-                    new_tokens.append(_make_range(start_col_letter, r1, end_col_letter))
-                    changed_here += 1
-                else:
-                    new_tokens.append(tok)
-        if changed_here:
-            cf.attrib["sqref"] = " ".join(new_tokens)
-            changed_total += changed_here
-    if changed_total:
-        print(f"CF expanded on {changed_total} token(s) to {start_col_letter}:{end_col_letter} for rows {sorted(target_rows)}")
-
-# ---------- chart patch (raw text) ----------
-def patch_summary_chart_ranges(root: Path, last_col_letter: str):
-    charts_dir = root / "xl/charts"
-    if not charts_dir.exists():
-        print("No xl/charts directory found.")
-        return
-    pat = re.compile(r"('Summary Details'!\$D\$(?P<row>8|9|10|11|12|13|14|15|16):\$[A-Z]{1,3}\$(?P=row))")
-    total_repl = 0
-    for chart_xml in sorted(charts_dir.glob("chart*.xml")):
-        try:
-            text = chart_xml.read_text(encoding="utf-8")
-        except Exception as e:
-            print("Skip read error:", chart_xml.name, e); continue
-        new_text, count = pat.subn(
-            lambda m: f"'Summary Details'!$D${m.group('row')}:${last_col_letter}${m.group('row')}",
-            text,
-        )
-        if count > 0:
-            try:
-                chart_xml.write_text(new_text, encoding="utf-8")
-                total_repl += count
-            except Exception as e:
-                print("Skip write error:", chart_xml.name, e)
-    print(f"Charts patched: {total_repl} ranges → last col {last_col_letter}")
-
-# ---------- summary helpers (copy + overrides) ----------
-def copy_formula_or_value_from_donor(summary_root, target_a1: str, donor_a1: str,
-                                     sheet_name: str, from_col: str, to_col: str,
-                                     chart_sheet: str, rows_bump: int):
-    donor = find_cell(summary_root, donor_a1)
-    if donor is None:
-        return False
-    f_el = donor.find(f"{NS}f")
-    if f_el is not None and f_el.text:
-        newf = transform_formula_using_pattern(
-            f_el.text, sheet_name, from_col, to_col, chart_sheet, rows_bump
-        )
-        set_formula(summary_root, target_a1, newf, style_donor_a1=donor_a1)
+# ------------- Source scan helpers ----------------
+def cell_has_content(c):
+    if c.find(f"{NS}f") is not None and (c.find(f"{NS}f").text or "") != "":
         return True
-    v_el = donor.find(f"{NS}v")
-    if v_el is not None and v_el.text is not None:
-        set_number_value(summary_root, target_a1, v_el.text, style_donor_a1=donor_a1)
+    if c.find(f"{NS}v") is not None and (c.find(f"{NS}v").text or "") != "":
         return True
+    if c.find(f"{NS}is") is not None:
+        t = c.find(f"{NS}is").find(f"{NS}t")
+        if t is not None and (t.text or "") != "":
+            return True
     return False
 
-def ensure_summary_col_with_overrides(summary_root, sheet_name: str,
-                                      target_col: str, chart_row_for_col: int):
-    col_M = TEMPLATE_LAST_COL
-    col_L = num_to_col(col_to_num(TEMPLATE_LAST_COL) - 1)
-    idx_target = col_to_num(target_col)
-    idx_M = col_to_num(col_M)
-    idx_L = col_to_num(col_L)
+def max_row_col_from(sheet_root, start_col_idx: int, start_row: int):
+    sd = sheet_root.find(f".//{NS}sheetData")
+    if sd is None: return start_row, start_col_idx
+    mr, mc = start_row, start_col_idx
+    for row in sd.findall(f"{NS}row"):
+        rnum = int(row.attrib.get("r","0"))
+        if rnum < start_row: continue
+        for c in row.findall(f"{NS}c"):
+            a1 = c.attrib.get("r") or ""
+            m = A1_RE.match(a1)
+            if not m: continue
+            ci = col_to_num(m.group(1))
+            if ci < start_col_idx: continue
+            if cell_has_content(c):
+                mr, mc = max(mr, rnum), max(mc, ci)
+    return mr, mc
 
-    for r in range(FIRST_ROW, LAST_ROW + 1):
-        tgt_a1 = f"{target_col}{r}"
-        tgt, row_el = ensure_cell(summary_root, tgt_a1)
-        for tag in (f"{NS}v", f"{NS}is", f"{NS}f"):
-            el = tgt.find(tag)
-            if el is not None:
-                tgt.remove(el)
-
-        cM = find_cell(summary_root, f"{col_M}{r}")
-        cL = find_cell(summary_root, f"{col_L}{r}")
-        if cM is not None and "s" in cM.attrib:
-            tgt.attrib["s"] = cM.attrib["s"]
-        elif cL is not None and "s" in cL.attrib:
-            tgt.attrib["s"] = cL.attrib["s"]
-
-        if sheet_name == "Summary Details":
-            if r == 8:
-                set_formula(summary_root, tgt_a1, f"'{SHEET_NAME_CHART}'!F{chart_row_for_col}"); continue
-            if r == 13:
-                set_formula(summary_root, tgt_a1, f"{target_col}11/{target_col}9"); continue
-            if r == 14:
-                set_formula(summary_root, tgt_a1, f"{target_col}13/$C$13*100"); continue
-            if r == 15:
-                set_formula(summary_root, tgt_a1, f"{target_col}11/{target_col}10"); continue
-            if r == 16:
-                set_formula(summary_root, tgt_a1, f"{target_col}15/$C$15*100"); continue
-
-        if sheet_name == "Time to Purchase Details - New":
-            if r == 8:
-                set_formula(summary_root, tgt_a1, f"'{SHEET_NAME_CHART}'!F{chart_row_for_col}"); continue
-            if r == 15:
-                set_formula(summary_root, tgt_a1,
-                    f"SUM({target_col}11*30,{target_col}12*60,{target_col}13*90,{target_col}14*120)/{target_col}9"
-                ); continue
-
-        if sheet_name == "Time to Purchase Details - Used":
-            if r == 8:
-                set_formula(summary_root, tgt_a1, f"'{SHEET_NAME_CHART}'!F{chart_row_for_col}"); continue
-            if r == 9:
-                set_formula(summary_root, tgt_a1, f"SUM({target_col}11:{target_col}14)"); continue
-
-        fM = (cM.find(f"{NS}f").text if (cM is not None and cM.find(f"{NS}f") is not None and cM.find(f"{NS}f").text) else None)
-        fL = (cL.find(f"{NS}f").text if (cL is not None and cL.find(f"{NS}f") is not None and cL.find(f"{NS}f").text) else None)
-        delta = infer_delta_from_L_vs_M(fL, fM, SHEET_NAME_CHART, default=1)
-
-        done = False
-        if fL:
-            off = idx_target - idx_L
-            done = copy_formula_or_value_from_donor(
-                summary_root, tgt_a1, f"{col_L}{r}",
-                sheet_name, col_L, target_col, SHEET_NAME_CHART, off * delta
-            )
-        if not done and fM:
-            off = idx_target - idx_M
-            done = copy_formula_or_value_from_donor(
-                summary_root, tgt_a1, f"{col_M}{r}",
-                sheet_name, col_M, target_col, SHEET_NAME_CHART, off * delta
-            )
-        if not done:
-            if cL is not None and cL.find(f"{NS}v") is not None:
-                set_number_value(summary_root, tgt_a1, cL.find(f"{NS}v").text or "0", style_donor_a1=f"{col_L}{r}")
-            elif cM is not None and cM.find(f"{NS}v") is not None:
-                set_number_value(summary_root, tgt_a1, cM.find(f"{NS}v").text or "0", style_donor_a1=f"{col_M}{r}")
-
-        sort_row_cells(row_el)
-        update_row_spans(row_el)
-
-    expand_dimension_to_include(summary_root, target_col, LAST_ROW)
-
-def delete_summary_columns_after(summary_root, kept_last_col: str):
-    kept_last_idx = col_to_num(kept_last_col)
-    for idx in range(kept_last_idx + 1, kept_last_idx + 60):
-        col = num_to_col(idx)
-        for r in range(FIRST_ROW, LAST_ROW + 1):
-            remove_cell(summary_root, f"{col}{r}")
-    shrink_dimension_to_col(summary_root, kept_last_col, LAST_ROW)
-
-# ---------- CLEAN: remove B12.. on given sheet ----------
-def clear_from_b12_onwards(work_root: Path, sheet_name: str):
-    try:
-        path = find_sheet_xml_by_name(work_root, sheet_name)
-    except FileNotFoundError:
-        print(f"[WARN] Sheet '{sheet_name}' not found.")
-        return
-    tree = ET.parse(path); root = tree.getroot()
-
-    sheetData = root.find(f".//{NS}sheetData")
-    if sheetData is None:
-        return
-
-    for row in list(sheetData.findall(f"{NS}row")):
-        rnum = int(row.attrib.get("r", "0"))
-        if rnum >= 12:
-            for c in list(row.findall(f"{NS}c")):
-                ref = c.attrib.get("r", "")
-                m = A1_RE.match(ref)
-                if not m: continue
-                col = m.group(1)
-                if col_to_num(col) >= col_to_num("B"):
-                    row.remove(c)
-            sort_row_cells(row)
-            update_row_spans(row)
-
-    shrink_dimension_to_col(root, "A", 11)
-    tree.write(path, encoding="utf-8", xml_declaration=True)
-    print(f"[CLEAR] Cleared B12.. in '{sheet_name}'")
-
-# ---------- Used → New mirroring for rows 15 & 16 (D..last) ----------
-def mirror_ttp_rows_used_to_new(work_root: Path, start_col_letter: str, end_col_letter: str, rows=(15, 16)):
-    new_path  = find_sheet_xml_by_name(work_root, "Time to Purchase Details - New")
-    used_path = find_sheet_xml_by_name(work_root, "Time to Purchase Details - Used")
-
-    new_tree  = ET.parse(new_path);  new_root  = new_tree.getroot()
-    used_tree = ET.parse(used_path); used_root = used_tree.getroot()
-
-    start_idx = col_to_num(start_col_letter)
-    end_idx   = col_to_num(end_col_letter)
-
-    for r in rows:
-        for idx in range(start_idx, end_idx + 1):
-            col = num_to_col(idx)
-            a1  = f"{col}{r}"
-            style_fallback = f"{TEMPLATE_LAST_COL}{r}"
-            # clone payload+style per cell
-            src = find_cell(used_root, a1)
-            dst, dst_row = ensure_cell(new_root, a1)
-            for tag in (f"{NS}v", f"{NS}is", f"{NS}f"):
-                el = dst.find(tag)
-                if el is not None:
-                    dst.remove(el)
-            dst.attrib.pop("t", None)
-            if src is not None:
-                # copy style
-                if "s" in src.attrib:
-                    dst.attrib["s"] = src.attrib["s"]
-                else:
-                    donor = find_cell(new_root, style_fallback)
-                    if donor is not None and "s" in donor.attrib:
-                        dst.attrib["s"] = donor.attrib["s"]
-                    else:
-                        dst.attrib.pop("s", None)
-                # copy payload
-                if src.find(f"{NS}f") is not None:
-                    ET.SubElement(dst, f"{NS}f").text = src.find(f"{NS}f").text or ""
-                elif src.find(f"{NS}is") is not None:
-                    dst.attrib["t"] = "inlineStr"
-                    is_dst = ET.SubElement(dst, f"{NS}is")
-                    t_src = src.find(f"{NS}is").find(f"{NS}t")
-                    if t_src is not None:
-                        ET.SubElement(is_dst, f"{NS}t").text = t_src.text or ""
-                elif src.find(f"{NS}v") is not None:
-                    v = ET.SubElement(dst, f"{NS}v")
-                    v.text = "" if src.find(f"{NS}v").text is None else str(src.find(f"{NS}v").text)
-            sort_row_cells(dst_row)
-            update_row_spans(dst_row)
-
-        expand_dimension_to_include(new_root, end_col_letter, r)
-
-    new_tree.write(new_path, encoding="utf-8", xml_declaration=True)
-    print(f"[MIRROR] Copied rows {rows} Used → New for {start_col_letter}:{end_col_letter}")
-
-# ---------- EXACT deep-clone C15 & C16 (Used → New) ----------
-def _deep_clone_cell(src_cell, new_ref: str):
-    # deep copy src <c> and adjust its r
-    clone = ET.fromstring(ET.tostring(src_cell))
-    clone.attrib["r"] = new_ref
-    return clone
-
-def _replace_cell_in_row(row_el, new_cell):
-    # remove any existing same-ref cell, then insert and keep order
-    ref = new_cell.attrib.get("r")
-    for c in list(row_el.findall(f"{NS}c")):
-        if c.attrib.get("r") == ref:
-            row_el.remove(c)
-    row_el.append(new_cell)
-    sort_row_cells(row_el)
-    update_row_spans(row_el)
-
-def copy_c15_c16_used_to_new_exact(work_root: Path):
-    """
-    EXACT copy of C15 and C16 from 'Time to Purchase Details - Used' → '... - New'.
-    Deep-clones the <c> nodes so value/formula/inlineStr/type/style are identical.
-    """
-    new_path  = find_sheet_xml_by_name(work_root, "Time to Purchase Details - New")
-    used_path = find_sheet_xml_by_name(work_root, "Time to Purchase Details - Used")
-
-    new_tree  = ET.parse(new_path);  new_root  = new_tree.getroot()
-    used_root = ET.parse(used_path).getroot()
-
-    for r in (15, 16):
-        ref = f"C{r}"
-        src_cell = find_cell(used_root, ref)
-        # Ensure destination row exists
-        _, dst_row = ensure_cell(new_root, ref)
-        if src_cell is not None:
-            cloned = _deep_clone_cell(src_cell, ref)
-            _replace_cell_in_row(dst_row, cloned)
-            expand_dimension_to_include(new_root, "C", r)
-        else:
-            # if Used has nothing, remove in New too
-            remove_cell(new_root, ref)
-
-    new_tree.write(new_path, encoding="utf-8", xml_declaration=True)
-    print("[EXACT] Deep-cloned C15 & C16 (Used → New)")
-
-# ---------- MAIN ----------
-def main():
-    if SELECTION_COUNT < 1:
-        raise ValueError("SELECTION_COUNT must be >= 1")
-
-    s3 = boto3.client("s3")
-
-    # download/unzip
-    buf = io.BytesIO()
-    s3.download_fileobj(BUCKET_IN, KEY_IN, buf)
-    buf.seek(0)
-    work = Path("/tmp/xlsx_all_in_one")
-    unzip_bytes(buf.getvalue(), work)
-    remove_calc_chain(work)
-
-    # === Charting Calculations ===
-    chart_path = find_sheet_xml_by_name(work, SHEET_NAME_CHART)
-    chart_tree = ET.parse(chart_path)
-    chart_root = chart_tree.getroot()
-
-    IST = timezone(timedelta(hours=5, minutes=30))
-    today_ddmmyyyy = datetime.now(IST).strftime("%d/%m/%Y")
-    set_inline_text(chart_root, "G4", "hamlin", style_donor_a1="F4")
-    set_inline_text(chart_root, "G5", today_ddmmyyyy, style_donor_a1="F5")
-    expand_dimension_to_include(chart_root, "G", 5)
-
-    existing_last = find_last_used_row_in_chart_col(chart_root, CHART_COL)
-    if existing_last < 7: existing_last = 6
-    existing_count = max(0, existing_last - 6)
-    need = SELECTION_COUNT - existing_count
-
-    if need > 0:
-        if need > len(APPEND_LABELS):
-            raise RuntimeError(f"Need {need} labels but only {len(APPEND_LABELS)} provided.")
-        current_last = existing_last
-        for i in range(need):
-            new_row = current_last + 1
-            label = APPEND_LABELS[i]
-            c, _ = ensure_cell(chart_root, f"{CHART_COL}{new_row}")
-            for tag in (f"{NS}v", f"{NS}is", f"{NS}f"):
-                el = c.find(tag)
-                if el is not None: c.remove(el)
-            c.attrib["t"] = "inlineStr"
-            is_el = ET.SubElement(c, f"{NS}is")
-            ET.SubElement(is_el, f"{NS}t").text = label
-            donor = find_cell(chart_root, f"{CHART_COL}{max(7, current_last)}")
-            if donor is not None and "s" in donor.attrib:
-                c.attrib["s"] = donor.attrib["s"]
-            expand_dimension_to_include(chart_root, CHART_COL, new_row)
-            current_last = new_row
-        existing_last = current_last
-        print(f"{SHEET_NAME_CHART}: appended {need} row(s) → F7..F{existing_last}")
-
-    if SELECTION_COUNT < existing_count:
-        keep_last = 6 + SELECTION_COUNT
-        for r in range(keep_last + 1, existing_last + 1):
-            remove_cell(chart_root, f"{CHART_COL}{r}")
-        existing_last = keep_last
-        print(f"{SHEET_NAME_CHART}: shrank to F7..F{existing_last}")
-
-    # Point B19..D23 and B27..D31 to New/Used
-    def SF(a, b): set_formula(chart_root, a, b)
-    for i, off in enumerate(range(19, 24)):
-        SF(f"B{off}", f"'{NEW_SHEET}'!B{off+3}")
-        SF(f"C{off}", f"'{NEW_SHEET}'!C{off+3}")
-        SF(f"D{off}", f"'{NEW_SHEET}'!D{off+3}")
-    for i, off in enumerate(range(27, 32)):
-        SF(f"B{off}", f"'{USED_SHEET}'!B{off-5}")
-        SF(f"C{off}", f"'{USED_SHEET}'!C{off-5}")
-        SF(f"D{off}", f"'{USED_SHEET}'!D{off-5}")
-    chart_tree.write(chart_path, encoding="utf-8", xml_declaration=True)
-
-    # === Summary sheets build ===
-    last_col_idx_needed = col_to_num(BASE_SUMMARY_FIRST_COL) + SELECTION_COUNT - 1
-    final_last_col = num_to_col(last_col_idx_needed)
-
-    for sheet_name in TARGET_SUMMARY_SHEETS:
+def source_cell_kind_payload(sst, c_el):
+    f_el = c_el.find(f"{NS}f")
+    if f_el is not None and f_el.text:
+        return ("formula", f_el.text)
+    t = c_el.attrib.get("t")
+    v = c_el.find(f"{NS}v")
+    if (t is None or t == "") and v is not None and v.text is not None:
+        return ("number", v.text)
+    if t == "s" and v is not None and v.text is not None:
         try:
-            s_path = find_sheet_xml_by_name(work, sheet_name)
-        except FileNotFoundError:
-            print(f"WARNING: sheet '{sheet_name}' not found; skipping.")
+            idx = int(v.text)
+            text = sst[idx] if 0 <= idx < len(sst) else ""
+        except Exception:
+            text = ""
+        return ("inline", text)
+    if t == "inlineStr":
+        is_el = c_el.find(f"{NS}is"); t_el = is_el.find(f"{NS}t") if is_el is not None else None
+        return ("inline", (t_el.text if t_el is not None else "") or "")
+    return ("blank", "")
+
+# ------------- Style helpers ---------------------
+def get_style_idx_for_cell(sheet_root, a1: str):
+    c = find_cell(sheet_root, a1)
+    if c is not None and "s" in c.attrib:
+        return c.attrib["s"]
+    return None
+
+def ensure_percent_2dec_style(styles_xml_path: Path, base_style_idx):
+    """Ensure there's an xf with numFmtId 10 (0.00%). Return its index as string."""
+    if not styles_xml_path.exists():
+        return base_style_idx if base_style_idx is not None else "0"
+    TT = lambda t: f"{{{NS_MAIN}}}{t}"
+    tree = ET.parse(styles_xml_path); root = tree.getroot()
+    cellXfs = root.find(TT("cellXfs"))
+    if cellXfs is None or len(list(cellXfs)) == 0:
+        return base_style_idx if base_style_idx is not None else "0"
+    xfs = cellXfs.findall(TT("xf"))
+    for i, xf in enumerate(xfs):
+        if xf.get("numFmtId") == "10":   # 0.00%
+            return str(i)
+    try:
+        base_idx = int(base_style_idx) if base_style_idx is not None else 0
+    except:
+        base_idx = 0
+    base_idx = base_idx if 0 <= base_idx < len(xfs) else 0
+    base = xfs[base_idx]
+    new_xf = ET.Element(TT("xf"), base.attrib)
+    new_xf.set("numFmtId", "10")
+    new_xf.set("applyNumberFormat", "1")
+    cellXfs.append(new_xf)
+    try:
+        cnt = int(cellXfs.get("count", str(len(xfs))))
+    except:
+        cnt = len(xfs)
+    cellXfs.set("count", str(cnt + 1))
+    tree.write(styles_xml_path, encoding="utf-8", xml_declaration=True)
+    return str(len(xfs))
+
+def a1_col_letter(a1: str) -> str:
+    i = 0
+    while i < len(a1) and a1[i].isalpha():
+        i += 1
+    return a1[:i] or "A"
+
+def a1_row_num(a1: str) -> int:
+    m = A1_RE.match(a1)
+    return int(m.group(2)) if m else 0
+
+# ------------- CSV dump with DEST shift ----------
+def dump_source_to_csv(src_root_dir: Path, sheets: list, src_start_col_letter: str,
+                       src_start_row: int, row_offset: int, max_src_row: int) -> bytes:
+    """
+    Dump only from src_start_row .. min(max_src_row, max_r_detected)
+    so we never copy anything >= max_src_row+1 via the bulk path.
+    """
+    sst = load_shared_strings(src_root_dir)
+    mem = io.StringIO()
+    w = csv.writer(mem)
+    w.writerow(["sheet","a1","kind","payload","style_tag"])
+
+    start_ci = col_to_num(src_start_col_letter)
+
+    for sheet in sheets:
+        p = find_sheet_xml_by_name(src_root_dir, sheet)
+        root = ET.parse(p).getroot()
+
+        max_r_detected, max_c = max_row_col_from(root, start_ci, src_start_row)
+        stop_r = min(max_r_detected, max_src_row)  # <= 18
+
+        if stop_r < src_start_row:
             continue
 
-        s_tree = ET.parse(s_path)
-        s_root = s_tree.getroot()
+        have = set()
+        sd = root.find(f".//{NS}sheetData")
+        if sd is not None:
+            for row in sd.findall(f"{NS}row"):
+                rn = int(row.attrib.get("r","0"))
+                if rn < src_start_row or rn > stop_r: continue
+                for c in row.findall(f"{NS}c"):
+                    a1 = c.attrib.get("r") or ""
+                    m = A1_RE.match(a1)
+                    if not m: continue
+                    ci = col_to_num(m.group(1))
+                    if ci < start_ci: continue
+                    if cell_has_content(c):
+                        have.add(a1)
 
-        base_idx = col_to_num(BASE_SUMMARY_FIRST_COL)
-        for idx in range(base_idx, last_col_idx_needed + 1):
-            col = num_to_col(idx)
-            chart_row = 7 + (idx - base_idx)
-            ensure_summary_col_with_overrides(s_root, sheet_name, col, chart_row)
+        for rn in range(src_start_row, stop_r + 1):
+            dest_rn = rn + row_offset
+            for ci in range(start_ci, max_c + 1):
+                col_letter = num_to_col(ci)
+                src_a1  = f"{col_letter}{rn}"
+                dest_a1 = f"{col_letter}{dest_rn}"
+                if src_a1 in have:
+                    c = find_cell(root, src_a1)
+                    kind, payload = source_cell_kind_payload(sst, c)
+                    w.writerow([sheet, dest_a1, kind, (payload if payload is not None else ""), "data"])
+                else:
+                    w.writerow([sheet, dest_a1, "blank", "", "empty"])
 
-        delete_summary_columns_after(s_root, final_last_col)
+    return mem.getvalue().encode("utf-8")
 
-        if sheet_name == "Summary Details":
-            for rownum in range(9, 13):
-                set_formula(s_root, f"C{rownum}", f"SUM(D{rownum}:{final_last_col}{rownum})")
-        if sheet_name in ("Time to Purchase Details - New", "Time to Purchase Details - Used"):
-            set_formula(s_root, "C9", f"SUM(D9:{final_last_col}9)")
+# ------------- Writers (apply) -------------------
+def write_inline(target_root, a1, text, style_idx=None):
+    m = A1_RE.match(a1); row = ensure_row(target_root, int(m.group(2)))
+    old = find_cell(target_root, a1)
+    if old is not None: row.remove(old)
+    c = ET.SubElement(row, f"{NS}c", {"r": a1})
+    if style_idx is not None: c.attrib["s"] = style_idx
+    c.attrib["t"] = "inlineStr"
+    is_el = ET.SubElement(c, f"{NS}is")
+    ET.SubElement(is_el, f"{NS}t").text = text or ""
+    sort_row_cells(row); update_row_spans(row)
 
-        if sheet_name == "Summary Details":
-            expand_conditional_formatting_for_rows(s_root, BASE_SUMMARY_FIRST_COL, final_last_col, rows_to_cover=[14, 15, 16])
+def write_number(target_root, a1, num_text, style_idx=None):
+    m = A1_RE.match(a1); row = ensure_row(target_root, int(m.group(2)))
+    old = find_cell(target_root, a1)
+    if old is not None: row.remove(old)
+    c = ET.SubElement(row, f"{NS}c", {"r": a1})
+    if style_idx is not None: c.attrib["s"] = style_idx
+    ET.SubElement(c, f"{NS}v").text = str(num_text)
+    c.attrib.pop("t", None)
+    sort_row_cells(row); update_row_spans(row)
+
+def write_formula(target_root, a1, formula_text, style_idx=None):
+    if not formula_text.startswith("="):
+        formula_text = "=" + formula_text
+    m = A1_RE.match(a1); row = ensure_row(target_root, int(m.group(2)))
+    old = find_cell(target_root, a1)
+    if old is not None: row.remove(old)
+    c = ET.SubElement(row, f"{NS}c", {"r": a1})
+    if style_idx is not None: c.attrib["s"] = style_idx
+    ET.SubElement(c, f"{NS}f").text = formula_text
+    c.attrib.pop("t", None)
+    sort_row_cells(row); update_row_spans(row)
+
+def write_blank_with_style(target_root, a1, style_idx=None):
+    m = A1_RE.match(a1); row = ensure_row(target_root, int(m.group(2)))
+    old = find_cell(target_root, a1)
+    if old is not None: row.remove(old)
+    c = ET.SubElement(row, f"{NS}c", {"r": a1})
+    if style_idx is not None: c.attrib["s"] = style_idx
+    c.attrib["t"] = "inlineStr"
+    is_el = ET.SubElement(c, f"{NS}is")
+    ET.SubElement(is_el, f"{NS}t").text = ""
+    sort_row_cells(row); update_row_spans(row)
+
+# ------------- Apply CSV to destination ----------
+def apply_csv_to_destination(dst_root_dir: Path, csv_bytes: bytes):
+    # Base styles for "empty" and per-sheet "data"
+    p_empty = find_sheet_xml_by_name(dst_root_dir, EMPTY_STYLE_SHEET)
+    r_empty = ET.parse(p_empty).getroot()
+    empty_style_idx = get_style_idx_for_cell(r_empty, EMPTY_STYLE_CELL)
+
+    data_style_idx = {}
+    for sheet in SHEETS:
+        p = find_sheet_xml_by_name(dst_root_dir, sheet)
+        r = ET.parse(p).getroot()
+        data_style_idx[sheet] = get_style_idx_for_cell(r, DATA_STYLE_REF_PER_SHEET.get(sheet, "C8"))
+
+    # Summary Details B19 style once
+    p_sum = find_sheet_xml_by_name(dst_root_dir, SUMMARY_SHEET_NAME)
+    r_sum = ET.parse(p_sum).getroot()
+    summary_b19_style = get_style_idx_for_cell(r_sum, SUMMARY_STYLE_REF)
+
+    styles_xml = dst_root_dir / "xl" / "styles.xml"
+    base_any = summary_b19_style or next((v for v in data_style_idx.values() if v is not None), "0")
+    percent_2dec_sidx = ensure_percent_2dec_style(styles_xml, base_any)
+
+    mem = io.StringIO(csv_bytes.decode("utf-8"))
+    rdr = csv.DictReader(mem)
+
+    cache = {}
+
+    for row in rdr:
+        sheet = row["sheet"]; a1 = row["a1"]; kind = row["kind"]
+        payload = row["payload"]; style_tag = row.get("style_tag","data")
+
+        p = find_sheet_xml_by_name(dst_root_dir, sheet)
+        k = p.as_posix()
+        if k not in cache:
+            t = ET.parse(p); cache[k] = (t, t.getroot(), p)
+        t, root, path = cache[k]
+
+        rn = a1_row_num(a1)
+        colL = a1_col_letter(a1)
+
+        # Decide style index:
+        if rn <= SUMMARY_STYLE_APPLY_UNTIL_ROW:
+            sidx = summary_b19_style
         else:
-            expand_conditional_formatting_for_rows(s_root, BASE_SUMMARY_FIRST_COL, final_last_col, rows_to_cover=[15, 16])
+            sidx = data_style_idx.get(sheet) if style_tag == "data" else empty_style_idx
+            if (colL in PERCENT_TWO_DEC_COLS) and (rn >= PERCENT_FROM_ROW):
+                sidx = percent_2dec_sidx
 
-        s_tree.write(s_path, encoding="utf-8", xml_declaration=True)
-        print(f"{sheet_name}: built D..{final_last_col} (count={SELECTION_COUNT}); totals+CF updated")
+        # write the cell
+        if kind == "formula":
+            write_formula(root, a1, payload, style_idx=sidx)
+        elif kind == "number":
+            write_number(root, a1, payload, style_idx=sidx)
+        elif kind == "inline":
+            write_inline(root, a1, payload, style_idx=sidx)
+        else:
+            write_blank_with_style(root, a1, style_idx=sidx)
 
-    # === Mirror D..last for rows 15 & 16 Used → New ===
-    mirror_ttp_rows_used_to_new(work, BASE_SUMMARY_FIRST_COL, final_last_col, rows=(15, 16))
+    # finalize dimension and write sheets
+    for k, (t, root, path) in cache.items():
+        max_col = "A"; max_row = 1
+        sd = root.find(f".//{NS}sheetData")
+        if sd is not None:
+            for row in sd.findall(f"{NS}row"):
+                rn = int(row.attrib.get("r","1"))
+                if rn > max_row: max_row = rn
+                for c in row.findall(f"{NS}c"):
+                    a1 = c.attrib.get("r") or "A1"
+                    m = A1_RE.match(a1)
+                    if m:
+                        col = m.group(1)
+                        if col_to_num(col) > col_to_num(max_col): max_col = col
+        expand_dimension_to_include(root, max_col, max_row)
+        t.write(path, encoding="utf-8", xml_declaration=True)
 
-    # === EXACT deep-clone C15 & C16 Used → New (AFTER mirroring, so nothing overwrites) ===
-    copy_c15_c16_used_to_new_exact(work)
+# ------------- Header style copier ---------------
+def copy_style(sheet_root, src_a1: str, dst_a1_list: list):
+    """Copy only the style index from src to each dst (no value change)."""
+    src = find_cell(sheet_root, src_a1)
+    if src is None: return
+    sidx = src.attrib.get("s")
+    if sidx is None: return
+    for a1 in dst_a1_list:
+        row = ensure_row(sheet_root, int(A1_RE.match(a1).group(2)))
+        c = find_cell(sheet_root, a1)
+        if c is None:
+            c = ET.SubElement(row, f"{NS}c", {"r": a1})
+        c.attrib["s"] = sidx
+        sort_row_cells(row); update_row_spans(row)
 
-    # Patch chart ranges (Summary Details)
-    patch_summary_chart_ranges(work, final_last_col)
+def apply_header_style_adjustments(dst_root_dir: Path):
+    """
+    Apply B8 style to [C19,D19,E19,F19,G19,H19,B20,B21] on each make/model sheet.
+    Done BEFORE mirroring so styles on F/G/H19 propagate to I/J/K… blocks.
+    """
+    targets = ["C19","D19","E19","F19","G19","H19","B20","B21"]
+    for sheet in SHEETS:
+        p = find_sheet_xml_by_name(dst_root_dir, sheet)
+        t = ET.parse(p); root = t.getroot()
+        copy_style(root, "B8", targets)
+        t.write(p, encoding="utf-8", xml_declaration=True)
 
-    # === CLEAR Top Make/Model sheets from B12 downward ===
-    clear_from_b12_onwards(work, NEW_SHEET)
-    clear_from_b12_onwards(work, USED_SHEET)
+# ------------- MIRRORING (F:G:H -> destinations) -------------
+def clone_cell_into(sheet_root, src_a1: str, dst_a1: str):
+    src = find_cell(sheet_root, src_a1)
+    m_dst = A1_RE.match(dst_a1)
+    if src is None or not m_dst:
+        return
+    row = ensure_row(sheet_root, int(m_dst.group(2)))
 
-    # zip/upload
-    out_bytes = rezip_dir(work)
-    s3.upload_fileobj(io.BytesIO(out_bytes), BUCKET_OUT, KEY_OUT)
-    print(f"SUCCESS: s3://{BUCKET_OUT}/{KEY_OUT}  (N={SELECTION_COUNT}; charts+summary updated; "
-          f"TTP New 15/16 mirrored D..last; C15/C16 deep-cloned from Used; Top Make/Model cleared)")
+    old = find_cell(sheet_root, dst_a1)
+    if old is not None:
+        row.remove(old)
+
+    c = ET.SubElement(row, f"{NS}c", {"r": dst_a1})
+    if "s" in src.attrib: c.attrib["s"] = src.attrib["s"]
+    if "t" in src.attrib: c.attrib["t"] = src.attrib["t"]
+
+    f_el = src.find(f"{NS}f")
+    if f_el is not None and f_el.text:
+        ET.SubElement(c, f"{NS}f").text = f_el.text
+    v_el = src.find(f"{NS}v")
+    if v_el is not None and v_el.text is not None:
+        ET.SubElement(c, f"{NS}v").text = v_el.text
+    is_el = src.find(f"{NS}is")
+    if is_el is not None:
+        is2 = ET.SubElement(c, f"{NS}is")
+        for child in list(is_el):
+            new_child = ET.SubElement(is2, child.tag)
+            new_child.text = child.text
+
+    sort_row_cells(row); update_row_spans(row)
+
+def compute_block_starts(selection_count: int):
+    """
+    Always start copies at column I. For count N, return columns:
+    I, L, O, ... (each block is 3 columns wide).
+    """
+    if selection_count <= 0:
+        return []
+    starts = []
+    start_idx = col_to_num("I")
+    for i in range(selection_count):
+        starts.append(num_to_col(start_idx + 3*i))
+    return starts
+
+def mirror_sheet_fixed_blocks(sheet_root, start_row: int, selection_count: int):
+    last_used = start_row
+    sd = sheet_root.find(f".//{NS}sheetData")
+    if sd is not None:
+        for row in sd.findall(f"{NS}row"):
+            rn = int(row.attrib.get("r","0"))
+            if rn < start_row: continue
+            for col in ("F","G","H"):
+                if find_cell(sheet_root, f"{col}{rn}") is not None:
+                    last_used = max(last_used, rn)
+
+    dest_starts = compute_block_starts(selection_count)
+
+    for rn in range(start_row, last_used + 1):
+        src_cols = ["F","G","H"]
+        for start_col in dest_starts:
+            start_idx = col_to_num(start_col)
+            for i, s_col in enumerate(src_cols):
+                src_a1 = f"{s_col}{rn}"
+                dst_col = num_to_col(start_idx + i)
+                dst_a1 = f"{dst_col}{rn}"
+                clone_cell_into(sheet_root, src_a1, dst_a1)
+
+    if dest_starts:
+        last_block_start = dest_starts[-1]
+        end_col = num_to_col(col_to_num(last_block_start) + 2)
+        expand_dimension_to_include(sheet_root, end_col, last_used)
+
+# ------------- Replicate src row 19 -> dest row 22 (PER SHEET) -------------
+def replicate_row19_to_dest_per_sheet(dst_root_dir: Path, src_root_dir: Path,
+                                      per_sheet_counts: dict, default_count: int = 0):
+    """
+    For each SHEET:
+      - Read SOURCE row 19, cols B..H (kind + payload)
+      - In DEST, write those values to rows 22..(21+repeat_count_for_that_sheet)
+        with normal 'data' style and percent enforcement for D/E/G/H (>= row 21)
+    """
+    sst = load_shared_strings(src_root_dir)
+    src_row = 19
+    dest_start_row = 22
+    cols = [chr(c) for c in range(ord('B'), ord('H')+1)]  # B..H
+
+    # Prepare base styles
+    p_empty = find_sheet_xml_by_name(dst_root_dir, EMPTY_STYLE_SHEET)
+    r_empty = ET.parse(p_empty).getroot()
+    empty_style_idx = get_style_idx_for_cell(r_empty, EMPTY_STYLE_CELL)
+
+    data_style_idx = {}
+    for sheet in SHEETS:
+        p_dst = find_sheet_xml_by_name(dst_root_dir, sheet)
+        r_dst = ET.parse(p_dst).getroot()
+        data_style_idx[sheet] = get_style_idx_for_cell(r_dst, DATA_STYLE_REF_PER_SHEET.get(sheet, "C8"))
+
+    styles_xml = dst_root_dir / "xl" / "styles.xml"
+    base_any = next((v for v in data_style_idx.values() if v is not None), "0")
+    percent_2dec_sidx = ensure_percent_2dec_style(styles_xml, base_any)
+
+    # For each sheet, read src B19..H19 then write to dest using its own repeat count
+    for sheet in SHEETS:
+        repeat_count = int(per_sheet_counts.get(sheet, default_count))
+        if repeat_count <= 0:
+            continue
+
+        p_src = find_sheet_xml_by_name(src_root_dir, sheet)
+        root_src = ET.parse(p_src).getroot()
+
+        p_dst = find_sheet_xml_by_name(dst_root_dir, sheet)
+        t_dst = ET.parse(p_dst); root_dst = t_dst.getroot()
+
+        # collect source kinds/payloads once
+        row_payloads = []
+        for col in cols:
+            c_el = find_cell(root_src, f"{col}{src_row}")
+            if c_el is None:
+                row_payloads.append(("blank", "")); continue
+            kind, payload = source_cell_kind_payload(sst, c_el)
+            row_payloads.append((kind, payload))
+
+        # write to dest rows
+        last_row_written = dest_start_row - 1
+        for i in range(repeat_count):
+            rn = dest_start_row + i
+            for idx, col in enumerate(cols):
+                kind, payload = row_payloads[idx]
+                # Decide style
+                sidx = data_style_idx.get(sheet) or empty_style_idx
+                if (col in PERCENT_TWO_DEC_COLS) and (rn >= PERCENT_FROM_ROW):
+                    sidx = percent_2dec_sidx
+
+                a1 = f"{col}{rn}"
+                if kind == "number":
+                    write_number(root_dst, a1, payload, style_idx=sidx)
+                elif kind == "inline":
+                    write_inline(root_dst, a1, payload, style_idx=sidx)
+                elif kind == "formula":
+                    write_formula(root_dst, a1, payload, style_idx=sidx)
+                else:
+                    write_blank_with_style(root_dst, a1, style_idx=sidx)
+
+            last_row_written = rn
+
+        # ensure dimension
+        expand_dimension_to_include(root_dst, cols[-1], last_row_written)
+        t_dst.write(p_dst, encoding="utf-8", xml_declaration=True)
+
+# ------------------ MAIN ------------------------
+def main():
+    s3 = boto3.client("s3")
+
+    buf_src = io.BytesIO(); s3.download_fileobj(SRC_BUCKET, SRC_KEY, buf_src); buf_src.seek(0)
+    buf_dst = io.BytesIO(); s3.download_fileobj(DST_IN_BUCKET, DST_IN_KEY, buf_dst); buf_dst.seek(0)
+
+    src_dir = Path("/tmp/xlsx_src_dump");  unzip_bytes(buf_src.getvalue(), src_dir)
+    dst_dir = Path("/tmp/xlsx_dst_apply"); unzip_bytes(buf_dst.getvalue(), dst_dir)
+
+    # Remove calcChain up front
+    remove_calc_chain(dst_dir)
+
+    # Bulk dump ONLY up to source row 18 (so nothing at/after 19 is bulk-copied)
+    csv_bytes = dump_source_to_csv(
+        src_dir, SHEETS, SRC_START_COL_LETTER, SRC_START_ROW, ROW_OFFSET, MAX_SRC_ROW_FOR_SHIFT
+    )
+    # (Optional) keep a diagnostics CSV in S3
+    s3.upload_fileobj(io.BytesIO(csv_bytes), CSV_BUCKET, CSV_KEY)
+    print(f"CSV written: s3://{CSV_BUCKET}/{CSV_KEY}  bytes={len(csv_bytes)}")
+
+    # Apply main values/styles to DEST (<= row 18 + shift)
+    apply_csv_to_destination(dst_dir, csv_bytes)
+
+    # Apply B8 style to C19..H19 and B20,B21 BEFORE mirroring
+    apply_header_style_adjustments(dst_dir)
+
+    # Replicate ONLY SOURCE row 19 (B..H) into DEST rows 22.. per sheet count
+    replicate_row19_to_dest_per_sheet(
+        dst_root_dir=dst_dir,
+        src_root_dir=src_dir,
+        per_sheet_counts=ROW_REPEAT_COUNT_PER_SHEET,
+        default_count=DEFAULT_ROW_REPEAT_COUNT
+    )
+
+    # Mirror F:G:H from row 14 across selection blocks (styles/values flow)
+    if SELECTION_COUNT > 0:
+        for sheet in SHEETS:
+            p = find_sheet_xml_by_name(dst_dir, sheet)
+            t = ET.parse(p); root = t.getroot()
+            mirror_sheet_fixed_blocks(root, MIRROR_START_ROW, SELECTION_COUNT)
+            t.write(p, encoding="utf-8", xml_declaration=True)
+    else:
+        print("SELECTION_COUNT=0 → mirroring skipped")
+
+    out_bytes = rezip_dir(dst_dir)
+    s3.upload_fileobj(io.BytesIO(out_bytes), OUT_BUCKET, OUT_KEY)
+    print(f"UPDATED workbook → s3://{OUT_BUCKET}/{OUT_KEY}")
 
 if __name__ == "__main__":
     main()
