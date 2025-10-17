@@ -1,202 +1,400 @@
-# interchanging b5 to b6 
 # -*- coding: utf-8 -*-
-"""
-Sheets 3–7:
-  - Write B6="Performance Window", C6="08/10/19_09/10/19" with B4 style
-  - TRUE SWAP B5 <-> B6  (content + style)
-  - COPY C6 -> C5, then CLEAR C6
-Sheet8 untouched.
-"""
+# ================= amp_sand_cell_update_csv_for_ara_dashboard (COMBINED) =================
+# What this does:
+#   • Charting Calculations: F7.. segment labels (from counts_by_segment)
+#   • Summary Details: D9..D12 values (record/match/purchase/vehicle)
+#   • Time to Purchase Details – New/Used:
+#       - Rows 11..14 bucket counts (0-30/31-60/61-90/90+)
+#       - Row 15 averages: F7->D15, F8->E15, ... (from "Average Days to Purchase" row per segment)
+#         C15 = mean of (D15,E15,F15,...)
+#       - Row 16 medians: from STATIC CSVs only.
+#         C16 = total_segments median (if present), D/E/F.. via F7/F8/F9 labels
+#   • Top Make, Model Details – New/Used:
+#       - PURE COPY/PASTE from provided source CSVs (values only, no formulas):
+#         Row 15:  src row 17, C..last  -> dest row 15, C..last
+#         Row 18:  src row 18, C..last  -> dest row 18, C..last
+#         Row 20:  src row 20, C..last  -> dest row 20, C..last
+#         Rows 21+: src rows 21.., B..last -> dest rows (row+1), B..last   (so 21->22, 22->23, ...)
+#
+# Notes:
+#   • Missing numerics => 0 so %s appear as 0.00% where relevant.
+#   • Output is a CSV of [sheet, cell, value] updates (values only; no formulas).
+#   • If SRC_TOPMM_* are omitted, the Top Make/Model sections just won’t emit updates here.
 
-import os, zipfile, tempfile, boto3
-import xml.etree.ElementTree as ET
+import csv, io, re, gzip, fnmatch, sys
+from urllib.parse import urlparse
+import boto3
+from awsglue.utils import getResolvedOptions
 
-# ---------- S3 CONFIG ----------
-S3_IN  = "s3://amp-caspex-sowmya/dashboard_output/Updated_ss.xlsx"
-S3_OUT = "s3://amp-caspex-sowmya/dashboard_output/Updated_swapped_final.xlsx"
+# ----------- GLUE ARGS -----------
+args = getResolvedOptions(
+    sys.argv,
+    [
+        "INPUT_COUNTS_BY_SEGMENT",
+        "INPUT_BPS_DATA",
+        "INPUT_TPS_NEW",
+        "INPUT_TPS_USED",
+        "OUT_URI",
+        
+    ],
+)
 
-# ---------- SHEETS (3–7 only) ----------
-SHEETS = {
-    "Summary Details": "xl/worksheets/sheet3.xml",
-    "Time to Purchase Details - New": "xl/worksheets/sheet4.xml",
-    "Time to Purchase Details - Used": "xl/worksheets/sheet5.xml",
-    "Top Make, Model Details - New": "xl/worksheets/sheet6.xml",
-    "Top Make, Model Details - Used": "xl/worksheets/sheet7.xml",
-}
+INPUT_COUNTS_BY_SEGMENT = args["INPUT_COUNTS_BY_SEGMENT"]
+INPUT_BPS_DATA          = args["INPUT_BPS_DATA"]
+INPUT_TPS_NEW           = args["INPUT_TPS_NEW"]    
+INPUT_TPS_USED          = args["INPUT_TPS_USED"]   
+OUT_URI                 = args["OUT_URI"]
+SRC_TOPMM_NEW           = "s3://amp-output-test-files/standard-ara-test-case10/amp-std-step045-outputs/topmm_layout_new.csv"
+SRC_TOPMM_USED          = "s3://amp-output-test-files/standard-ara-test-case10/amp-std-step045-outputs/topmm_layout_used.csv"
 
-# ---------- NAMESPACES ----------
-NS = {
-    "main":  "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-    "r":     "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-    "mc":    "http://schemas.openxmlformats.org/markup-compatibility/2006",
-    "x14ac": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac",
-}
-for p, v in NS.items():
-    ET.register_namespace("" if p == "main" else p, v)
-def T(local): return f"{{{NS['main']}}}{local}"
+# ---- STATIC median CSVs (change if needed) ----
+STATIC_MEDIAN_NEW_CSV  = "s3://amp-output-test-files/standard-ara-test-case10/amp-std-step04-outputs/TPS-New-Used-DateDelta-data/median_new.csv"
+STATIC_MEDIAN_USED_CSV = "s3://amp-output-test-files/standard-ara-test-case10/amp-std-step04-outputs/TPS-New-Used-DateDelta-data/median_used.csv"
 
-# ---------- helpers ----------
-def s3_split(uri):
-    b, k = uri[5:].split("/", 1); return b, k
+s3 = boto3.client("s3")
 
-def ensure_row(ws_root, row_idx):
-    sd = ws_root.find(T("sheetData"))
-    if sd is None: sd = ET.SubElement(ws_root, T("sheetData"))
-    for r in sd.findall(T("row")):
-        if int(r.get("r")) == row_idx: return r
-    new_r = ET.Element(T("row"), {"r": str(row_idx)})
-    rows = sd.findall(T("row"))
-    for i, r in enumerate(rows):
-        if int(r.get("r")) > row_idx:
-            sd.insert(i, new_r); return new_r
-    sd.append(new_r); return new_r
+# ----------- HELPERS -----------
+def parse_s3_uri(uri: str):
+    p = urlparse(uri)
+    return p.netloc, p.path.lstrip("/")
 
-def ensure_cell(row_el, col, row_idx):
-    ref = f"{col}{row_idx}"
-    for c in row_el.findall(T("c")):
-        if c.get("r") == ref: return c
-    new_c = ET.Element(T("c"), {"r": ref})
-    row_el.append(new_c)
-    return new_c
+def folder_prefix(uri: str):
+    b, k = parse_s3_uri(uri)
+    if k and not k.endswith("/"):
+        k = "/".join(k.split("/")[:-1]) + "/"
+    if k and not k.endswith("/"):
+        k += "/"
+    return b, k
 
-def find_cell(ws_root, a1):
-    row_idx = int("".join(ch for ch in a1 if ch.isdigit()))
-    sd = ws_root.find(T("sheetData"))
-    if sd is None: return None, None
-    for row in sd.findall(T("row")):
-        if int(row.get("r")) == row_idx:
-            for c in row.findall(T("c")):
-                if c.get("r") == a1: return row, c
-            return row, None
-    return None, None
+def find_one_data_file(s3_uri_or_folder: str) -> str:
+    bucket, key = parse_s3_uri(s3_uri_or_folder)
+    if key and not key.endswith("/"):
+        return f"s3://{bucket}/{key}"
+    b, prefix = folder_prefix(s3_uri_or_folder)
+    patterns = ["part-*", "*.csv", "*.CSV", "*.txt", "*.TXT", "*.gz", "*.GZ"]
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=b, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            name = obj["Key"].split("/")[-1]
+            if any(fnmatch.fnmatch(name, pat) for pat in patterns):
+                return f"s3://{b}/{obj['Key']}"
+    raise FileNotFoundError(f"No data file found under {s3_uri_or_folder}")
 
-def set_inline_string(cell, text, style_index=None):
-    for ch in list(cell): cell.remove(ch)
-    cell.attrib.pop("t", None)
-    cell.set("t", "inlineStr")
-    if style_index is not None: cell.set("s", style_index)
-    is_el = ET.SubElement(cell, T("is"))
-    t_el  = ET.SubElement(is_el, T("t"))
-    t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-    t_el.text = text
+def read_csv_from_s3(s3_uri: str):
+    bucket, key = parse_s3_uri(s3_uri)
+    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    if key.lower().endswith(".gz"):
+        body = gzip.decompress(body)
+    text = body.decode("utf-8", errors="replace")
+    rdr = csv.DictReader(io.StringIO(text))
+    rdr.fieldnames = [(h.strip().lower() if isinstance(h, str) else h) for h in rdr.fieldnames]
+    rows = []
+    for r in rdr:
+        rows.append({
+            (k.strip().lower() if isinstance(k, str) else k):
+            (v.strip() if isinstance(v, str) else v)
+            for k, v in r.items()
+        })
+    return rows
 
-def deep_copy(elem):
-    new = ET.Element(elem.tag, elem.attrib)
-    new.text, new.tail = elem.text, elem.tail
-    for ch in list(elem): new.append(deep_copy(ch))
-    return new
+def read_matrix_from_csv(s3_uri: str):
+    """Read CSV as a 2D list (matrix) of trimmed strings."""
+    b, k = parse_s3_uri(s3_uri)
+    body = s3.get_object(Bucket=b, Key=k)["Body"].read()
+    if k.lower().endswith(".gz"):
+        body = gzip.decompress(body)
+    text = body.decode("utf-8", errors="replace")
+    rdr = csv.reader(io.StringIO(text))
+    matrix = []
+    for row in rdr:
+        matrix.append([(c.strip() if isinstance(c, str) else c) for c in row])
+    return matrix
 
-def clone_cell_contents(src, dst):
-    """Clone full XML (formula/value/inlineStr/style) from src -> dst."""
-    ref = dst.get("r")
-    for ch in list(dst): dst.remove(ch)
-    for k in list(dst.attrib.keys()):
-        if k != "r": dst.attrib.pop(k, None)
-    if src is not None:
-        for k, v in src.attrib.items():
-            if k != "r": dst.set(k, v)
-        for ch in list(src): dst.append(deep_copy(ch))
-    dst.set("r", ref)
+def excel_col(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
-def clear_cell(cell):
-    if cell is None: return
-    for ch in list(cell): cell.remove(ch)
-    for k in list(cell.attrib.keys()):
-        if k not in ["r"]: cell.attrib.pop(k, None)
+def to_f(x):
+    try:
+        return float(str(x).replace(",", "")) if x not in (None, "") else 0.0
+    except Exception:
+        return 0.0
 
-def update_dimension(ws_root):
-    sd = ws_root.find(T("sheetData"))
-    if sd is None: return
-    max_row = 0; max_col = 0
-    for r in sd.findall(T("row")):
-        rn = int(r.get("r")); max_row = max(max_row, rn)
-        for c in r.findall(T("c")):
-            ref = c.get("r")
-            letters = "".join(ch for ch in ref if ch.isalpha())
-            n = 0
-            for ch in letters: n = n*26 + (ord(ch.upper())-64)
-            max_col = max(max_col, n)
-    if max_row and max_col:
-        n = max_col; letters = ""
-        while n:
-            n, r = divmod(n-1, 26)
-            letters = chr(65+r) + letters
-        dim = ws_root.find(T("dimension"))
-        if dim is None:
-            dim = ET.Element(T("dimension"))
-            ws_root.insert(0, dim)
-        dim.set("ref", f"A1:{letters}{max_row}")
+def fmt_num(x):
+    f = to_f(x)
+    return str(int(f)) if abs(f - int(f)) < 1e-9 else f"{f:.3f}"
 
-# ---------- main ----------
+def pretty_segment(seg):
+    return re.sub(r"\s{2,}", " ", (seg or "")).strip()
+
+# ----------- CHARTING CALC LABELS -----------
+def build_charting_labels(segments):
+    sheet = "Charting Calculations"
+    rows = []
+    f_values = []
+    start_col = 6  # F
+    for i, seg in enumerate(segments):
+        col = excel_col(start_col + i)
+        val = pretty_segment(seg)
+        rows.append([sheet, f"{col}7", val])
+        f_values.append(val)
+    return rows, f_values
+
+# ----------- SUMMARY DETAILS -----------
+def build_summary_details(segments, bps_map):
+    rows = []
+    for i, seg in enumerate(segments):
+        col = excel_col(4 + i)  # D/E/F...
+        b = bps_map.get(seg, {})
+        rows.append(["Summary Details", f"{col}9",  fmt_num(b.get("record_count", 0))])
+        rows.append(["Summary Details", f"{col}10", fmt_num(b.get("match_count", 0))])
+        rows.append(["Summary Details", f"{col}11", fmt_num(b.get("purchase_count", 0))])
+        rows.append(["Summary Details", f"{col}12", fmt_num(b.get("vehicle_count", 0))])
+    return rows
+
+# ----------- TtP (rows 11..14 buckets) -----------
+_R_RANGE = r"(?:-|–|—|_|to)"
+_RE_0_30  = re.compile(r"\b0\s*%s\s*30\b" % _R_RANGE)
+_RE_31_60 = re.compile(r"\b31\s*%s\s*60\b" % _R_RANGE)
+_RE_61_90 = re.compile(r"\b61\s*%s\s*90\b" % _R_RANGE)
+_RE_AVG   = re.compile(r"\baverage\b", re.IGNORECASE)
+_RE_90P   = re.compile(r"(?:90\+|>\s*90\b)")
+
+def classify_bucket(label: str) -> str:
+    if not label: return "other"
+    s = re.sub(r"\s+", " ", label.strip().lower())
+    if _RE_AVG.search(s): return "avg"
+    if _RE_0_30.search(s): return "0_30"
+    if _RE_31_60.search(s): return "31_60"
+    if _RE_61_90.search(s): return "61_90"
+    if _RE_90P.search(s): return "other"
+    if re.search(r"\d+\s*%s\s*\d+" % _R_RANGE, s): return "other"
+    return "other"
+
+def write_ttp_buckets(sheet_name, segments, tps_rows):
+    rows = [[sheet_name, "B14", "90+ Days"]]
+    by_seg = {}
+    for r in tps_rows:
+        seg = pretty_segment(r.get("seg"))
+        if seg: by_seg.setdefault(seg, []).append(r)
+
+    for i, seg in enumerate(segments):
+        col = excel_col(4 + i)
+        sums = {"0_30":0.0,"31_60":0.0,"61_90":0.0,"other":0.0}
+        for r in by_seg.get(seg, []):
+            bucket = classify_bucket(
+                r.get("daystopurchase") or r.get("days_to_purchase") or r.get("days to purchase") or ""
+            )
+            if bucket == "avg": 
+                continue
+            sums[bucket] += to_f(r.get("cnt", 0))
+        rows += [
+            [sheet_name, f"{col}11", fmt_num(sums["0_30"])],
+            [sheet_name, f"{col}12", fmt_num(sums["31_60"])],
+            [sheet_name, f"{col}13", fmt_num(sums["61_90"])],
+            [sheet_name, f"{col}14", fmt_num(sums["other"])],
+        ]
+    return rows
+
+# ----------- Row 15 AVG (from "Average Days to Purchase" row) -----------
+def avg_map_from_daysfile(tps_rows):
+    if not tps_rows: return {}
+    keys = set(tps_rows[0].keys())
+    label_cols = [c for c in ["daystopurchase","days_to_purchase","days to purchase","label","bucket"] if c in keys]
+    seg_col    = "seg" if "seg" in keys else ("segment" if "segment" in keys else None)
+
+    def is_avg(lbl: str) -> bool:
+        return bool(lbl) and re.search(r"average", lbl.strip(), re.I) is not None
+
+    avg_map = {}
+    for r in tps_rows:
+        seg = pretty_segment(r.get(seg_col, "")) if seg_col else ""
+        label = ""
+        for c in label_cols:
+            if r.get(c):
+                label = r.get(c)
+                break
+        if not seg or not is_avg(label):
+            continue
+        # first numeric value in the row (skip seg/label fields)
+        value = None
+        for k, v in r.items():
+            if k in (seg_col, *label_cols): 
+                continue
+            try:
+                value = float(str(v).replace(",", ""))
+                break
+            except Exception:
+                pass
+        avg_map[seg] = value if value is not None else 0.0
+    return avg_map
+
+def write_ttp_avg_row15(sheet_name, cc_f_values, avg_map):
+    rows = []
+    filled = []
+    for idx, label in enumerate(cc_f_values):
+        seg = pretty_segment(label)
+        col = excel_col(4 + idx)  # D/E/F...
+        val = avg_map.get(seg, 0.0)
+        rows.append([sheet_name, f"{col}15", fmt_num(val)])
+        filled.append(val)
+    rows.append([sheet_name, "C15", fmt_num(sum(filled)/len(filled) if filled else 0.0)])
+    return rows
+
+# ----------- Row 16 MEDIAN (STATIC CSVs) -----------
+def read_median_csv_map(s3_uri_or_folder: str):
+    rows = read_csv_from_s3(find_one_data_file(s3_uri_or_folder))
+    per_seg, total_med = {}, None
+    for r in rows:
+        seg = pretty_segment(r.get("segment"))
+        med = to_f(r.get("median"))
+        if not seg: 
+            continue
+        if seg.lower() == "total_segments":
+            total_med = med
+        else:
+            per_seg[seg] = med
+    return per_seg, total_med
+
+def build_tps_median_cells_from_map(sheet_name, cc_f_values, median_map, total_segments_median):
+    rows = []
+    if total_segments_median is not None:
+        rows.append([sheet_name, "C16", fmt_num(total_segments_median)])
+    for idx, label in enumerate(cc_f_values):
+        seg_name = pretty_segment(label)
+        col = excel_col(4 + idx)  # D/E/F...
+        rows.append([sheet_name, f"{col}16", fmt_num(median_map.get(seg_name, 0.0))])
+    return rows
+
+# ----------- Top Make/Model COPY/PASTE -----------
+def last_nonempty_col_index(row):
+    idx = 0
+    for i, v in enumerate(row, start=1):
+        if (str(v).strip() if v is not None else "") != "":
+            idx = i
+    return idx
+
+def is_row_empty(row, from_col=1):
+    for i in range(from_col-1, len(row)):
+        v = row[i]
+        if (str(v).strip() if v is not None else "") != "":
+            return False
+    return True
+
+def value(v):
+    if v is None: return ""
+    return str(v).strip()
+
+def copy_top_mm_from_source(sheet_name: str, src_matrix, out_rows):
+    """
+    Copy from source CSV to destination 'sheet_name' (values only).
+      Row 15 : src row 17, C..last -> dest row 15
+      Row 18 : src row 18, C..last -> dest row 18
+      Row 20 : src row 20, C..last -> dest row 20
+      Row 21+: src rows 21.., B..last -> dest rows (row+1)
+    """
+    def write_row_segment(src_row_idx_1based, dest_row_idx_1based, start_col_idx_1based):
+        if src_row_idx_1based < 1 or src_row_idx_1based > len(src_matrix):
+            return
+        src_row = src_matrix[src_row_idx_1based - 1]
+        last_col = last_nonempty_col_index(src_row)
+        if last_col < start_col_idx_1based:
+            return
+        for c in range(start_col_idx_1based, last_col + 1):
+            v = value(src_row[c - 1])
+            if v == "":
+                continue
+            out_rows.append([sheet_name, f"{excel_col(c)}{dest_row_idx_1based}", v])
+
+    # fixed rows
+    write_row_segment(17, 15, 3)  # row 15 from src row 17 (C..)
+    write_row_segment(18, 18, 3)  # row 18 from src row 18 (C..)
+    write_row_segment(20, 20, 3)  # row 20 from src row 20 (C..)
+
+    # body rows: 21.. copy B.. -> dest row+1
+    for r in range(21, len(src_matrix) + 1):
+        row = src_matrix[r - 1]
+        if is_row_empty(row, from_col=2):  # B..
+            continue
+        dest_r = r + 1
+        last_col = last_nonempty_col_index(row)
+        if last_col >= 2:
+            for c in range(2, last_col + 1):
+                v = value(row[c - 1])
+                if v == "":
+                    continue
+                out_rows.append([sheet_name, f"{excel_col(c)}{dest_r}", v])
+
+# ----------- MAIN -----------
 def main():
-    s3 = boto3.client("s3")
-    in_b, in_k = s3_split(S3_IN)
-    out_b, out_k = s3_split(S3_OUT)
+    # read inputs
+    counts_rows     = read_csv_from_s3(find_one_data_file(INPUT_COUNTS_BY_SEGMENT))
+    bps_rows        = read_csv_from_s3(find_one_data_file(INPUT_BPS_DATA))
+    new_rows        = read_csv_from_s3(find_one_data_file(INPUT_TPS_NEW))    # has 'Average' rows
+    used_rows       = read_csv_from_s3(find_one_data_file(INPUT_TPS_USED))   # has 'Average' rows
 
-    tmp = tempfile.mkdtemp(prefix="xlsx_fix_swap_")
-    in_zip, out_zip = os.path.join(tmp, "in.xlsx"), os.path.join(tmp, "out.xlsx")
-    unz = os.path.join(tmp, "unz")
+    # segment order
+    segments = []
+    for r in counts_rows:
+        s = pretty_segment(r.get("seg"))
+        if s: segments.append(s)
 
-    # fetch + unzip
-    s3.download_file(in_b, in_k, in_zip)
-    with zipfile.ZipFile(in_zip, "r") as zf: zf.extractall(unz)
+    # BPS map
+    bps_map = {}
+    for r in bps_rows:
+        seg = pretty_segment(r.get("seg"))
+        if not seg: continue
+        bps_map[seg] = {
+            "record_count":   to_f(r.get("record_count", 0)),
+            "match_count":    to_f(r.get("match_count", 0)),
+            "purchase_count": to_f(r.get("purchase_count", 0)),
+            "vehicle_count":  to_f(r.get("vehicle_count", 0)),
+        }
 
-    for sheet_name, xml_relpath in SHEETS.items():
-        full = os.path.join(unz, xml_relpath)
-        if not os.path.exists(full):
-            print(f"⚠️ {sheet_name} missing ({xml_relpath}) — skip"); continue
+    out = []
+    out.append(["sheet", "cell", "value"])
 
-        ws_tree = ET.parse(full); ws_root = ws_tree.getroot()
+    # Charting Calculations F7.. (capture F7/F8/F9)
+    cc_rows, cc_f_values = build_charting_labels(segments)
+    out += cc_rows
 
-        # styles from B4
-        _, b4 = find_cell(ws_root, "B4")
-        style_b4 = b4.get("s") if (b4 is not None and b4.get("s")) else None
+    # Summary Details
+    out += build_summary_details(segments, bps_map)
 
-        # ensure rows/cells
-        r6 = ensure_row(ws_root, 6)
-        b6 = ensure_cell(r6, "B", 6)
-        c6 = ensure_cell(r6, "C", 6)
+    # Time to Purchase buckets and AVERAGES (row 15)
+    out += write_ttp_buckets("Time to Purchase Details - New",  segments, new_rows)
+    out += write_ttp_buckets("Time to Purchase Details - Used", segments, used_rows)
 
-        # write labels
-        set_inline_string(b6, "Performance Window", style_b4)
-        set_inline_string(c6, "08/10/19_09/10/19", style_b4)
+    new_avg_map  = avg_map_from_daysfile(new_rows)
+    used_avg_map = avg_map_from_daysfile(used_rows)
+    out += write_ttp_avg_row15("Time to Purchase Details - New",  cc_f_values, new_avg_map)
+    out += write_ttp_avg_row15("Time to Purchase Details - Used", cc_f_values, used_avg_map)
 
-        # B5 <-> B6 true swap
-        _, b5 = find_cell(ws_root, "B5")
-        if b5 is None:
-            r5 = ensure_row(ws_root, 5)
-            b5 = ensure_cell(r5, "B", 5)
-        tmp = ET.Element(T("c"), {"r": "TMP"})
-        clone_cell_contents(b5, tmp)
-        clone_cell_contents(b6, b5)
-        clone_cell_contents(tmp, b6)
+    # Row 16 MEDIANS (static)
+    new_med_map,  new_total_med  = read_median_csv_map(STATIC_MEDIAN_NEW_CSV)
+    used_med_map, used_total_med = read_median_csv_map(STATIC_MEDIAN_USED_CSV)
+    out += build_tps_median_cells_from_map("Time to Purchase Details - New",  cc_f_values, new_med_map,  new_total_med)
+    out += build_tps_median_cells_from_map("Time to Purchase Details - Used", cc_f_values, used_med_map, used_total_med)
 
-        # COPY C6 -> C5, then CLEAR C6
-        _, c5 = find_cell(ws_root, "C5")
-        if c5 is None:
-            r5 = ensure_row(ws_root, 5)
-            c5 = ensure_cell(r5, "C", 5)
-        clone_cell_contents(c6, c5)
-        clear_cell(c6)
+    # Top Make, Model Details – COPY/PASTE from provided sources
+    if SRC_TOPMM_NEW:
+        src_new_mat = read_matrix_from_csv(find_one_data_file(SRC_TOPMM_NEW))
+        copy_top_mm_from_source("Top Make, Model Details - New", src_new_mat, out)
+    if SRC_TOPMM_USED:
+        src_used_mat = read_matrix_from_csv(find_one_data_file(SRC_TOPMM_USED))
+        copy_top_mm_from_source("Top Make, Model Details - Used", src_used_mat, out)
 
-        update_dimension(ws_root)
-        ws_tree.write(full, encoding="utf-8", xml_declaration=True)
-        print(f"✅ {sheet_name} done")
-
-    # cleanup calcChain
-    calc = os.path.join(unz, "xl", "calcChain.xml")
-    if os.path.exists(calc):
-        os.remove(calc)
-        print("🧹 removed xl/calcChain.xml")
-
-    # rezip + upload
-    with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
-        for folder, _, files in os.walk(unz):
-            for fn in files:
-                fp = os.path.join(folder, fn)
-                z.write(fp, os.path.relpath(fp, unz))
-    s3.upload_file(out_zip, out_b, out_k)
-    print(f"🚀 Uploaded: {S3_OUT}")
+    # write updates CSV
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    for r in out:
+        w.writerow(r)
+    bkt, key = parse_s3_uri(OUT_URI)
+    s3.put_object(Bucket=bkt, Key=key, Body=buf.getvalue().encode("utf-8"))
+    print(f"✅ Wrote {len(out)-1} updates to {OUT_URI}")
 
 if __name__ == "__main__":
     main()
