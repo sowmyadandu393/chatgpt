@@ -1,102 +1,173 @@
-#amp_sand_dashboard_sheet_updating_ss
+# perfectly working performance window for all sheets
+
 # -*- coding: utf-8 -*-
 """
-Safe, surgical caption patch for Excel drawings:
-Replaces only the inner text of <a:t> that contains 'specified timeframe and audience'
-without reserializing XML (prevents Excel 'content' errors).
+Hardcoded multi-sheet update (no formulas):
+- For sheets 3–7: Copy B4 style to B6 & C6, set text
+- For sheet8.xml: Copy G4 style to G6 & H6, set text
 """
 
-import io, os, re, zipfile, shutil, boto3
-from pathlib import Path
+import os, zipfile, tempfile, boto3
+import xml.etree.ElementTree as ET
 
-# ---- S3 paths ----
-S3_IN  = "s3://amp-caspex-sowmya/dashboard-output/sanitized_debug_filled.xlsx"
-S3_OUT = "s3://amp-caspex-sowmya/dashboard_output/Updated_Dashboard_Hamlin.xlsx"
-S3_DBG_PREFIX = "s3://amp-caspex-sowmya/dashboard_output/debug/"
+# ---------- S3 CONFIG ----------
+S3_IN  = "s3://amp-caspex-sowmya/dashboard_output/Updated_Dashboard_Hamlin.xlsx"
+S3_OUT = "s3://amp-caspex-sowmya/dashboard_output/Updated_ss.xlsx"
 
-# ---- replacement text (ASCII hyphen to be extra-safe) ----
-NEW_TEXT = "Client:Hamlin\nTime_Period:08/09/19_09/09/19"
+# ---------- HARDCODED SHEET MAP ----------
+SHEETS = {
+    "Summary Details": "xl/worksheets/sheet3.xml",
+    "Time to Purchase Details - New": "xl/worksheets/sheet4.xml",
+    "Time to Purchase Details - Used": "xl/worksheets/sheet5.xml",
+    "Top Make, Model Details - New": "xl/worksheets/sheet6.xml",
+    "Top Make, Model Details - Used": "xl/worksheets/sheet7.xml",
+    "Charting Calculations": "xl/worksheets/sheet8.xml",  # G6 & H6 update
+}
 
-# ---- helpers ----
-def s3split(uri): return uri[5:].split("/", 1)
-def s3get(uri):
-    b,k = s3split(uri); buf = io.BytesIO()
-    boto3.client("s3").download_fileobj(b,k,buf)
-    buf.seek(0); return buf.getvalue()
-def s3put_bytes(uri, data: bytes):
-    b,k = s3split(uri); boto3.client("s3").upload_fileobj(io.BytesIO(data), b, k)
+# ---------- NAMESPACES ----------
+NS = {
+    "main":  "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "r":     "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "mc":    "http://schemas.openxmlformats.org/markup-compatibility/2006",
+    "x14ac": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac",
+}
+for p, v in NS.items():
+    ET.register_namespace("" if p == "main" else p, v)
+def T(local): return f"{{{NS['main']}}}{local}"
 
-def unzip_to(data: bytes, out_dir: Path):
-    if out_dir.exists(): shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(io.BytesIO(data)) as z: z.extractall(out_dir)
+# ---------- HELPERS ----------
+def s3_split(uri):
+    b, k = uri[5:].split("/", 1); return b, k
 
-def rezip_dir(root: Path) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for base, _, files in os.walk(root):
-            for f in files:
-                p = Path(base)/f
-                z.write(p, p.relative_to(root).as_posix())
-    buf.seek(0); return buf.getvalue()
+def ensure_row(ws_root, row_idx):
+    sd = ws_root.find(T("sheetData"))
+    if sd is None: sd = ET.SubElement(ws_root, T("sheetData"))
+    for r in sd.findall(T("row")):
+        if int(r.get("r")) == row_idx: return r
+    new_r = ET.Element(T("row"), {"r": str(row_idx)})
+    rows = sd.findall(T("row"))
+    for i, r in enumerate(rows):
+        if int(r.get("r")) > row_idx:
+            sd.insert(i, new_r); return new_r
+    sd.append(new_r); return new_r
 
-# ---- core: patch drawings by raw regex on <a:t>…</a:t> ----
-# match a:t opening tag, capture attributes, capture inner text, closing tag
-ATAG_RE = re.compile(rb"(<a:t\b[^>]*>)(.*?)(</a:t>)", re.DOTALL | re.IGNORECASE)
-TARGET_RE = re.compile(rb"specified\s*time\s*frame|specified\s*timeframe", re.IGNORECASE)
+def ensure_cell(row_el, col, row_idx):
+    ref = f"{col}{row_idx}"
+    for c in row_el.findall(T("c")):
+        if c.get("r") == ref: return c
+    new_c = ET.Element(T("c"), {"r": ref})
+    row_el.append(new_c)
+    return new_c
 
-def patch_drawing_xml_bytes(xml_bytes: bytes) -> tuple[bytes, bool, int]:
-    changed = False
-    matches = 0
+def find_cell(ws_root, a1):
+    row_idx = int("".join(ch for ch in a1 if ch.isdigit()))
+    sd = ws_root.find(T("sheetData"))
+    if sd is None: return None, None
+    for row in sd.findall(T("row")):
+        if int(row.get("r")) == row_idx:
+            for c in row.findall(T("c")):
+                if c.get("r") == a1: return row, c
+            return row, None
+    return None, None
 
-    def repl(m):
-        nonlocal changed, matches
-        open_tag, inner, close_tag = m.group(1), m.group(2), m.group(3)
-        # quick filter: only alter blocks whose current text contains the target phrase
-        if TARGET_RE.search(inner) and b"audience" in inner.lower():
-            matches += 1
-            changed = True
-            # preserve existing whitespace handling; just replace the inner text
-            return open_tag + NEW_TEXT.encode("utf-8") + close_tag
-        return m.group(0)
+def set_inline_string(cell, text, style_index=None):
+    for ch in list(cell): cell.remove(ch)
+    cell.set("t", "inlineStr")
+    if style_index is not None: cell.set("s", style_index)
+    is_el = ET.SubElement(cell, T("is"))
+    t_el  = ET.SubElement(is_el, T("t"))
+    t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    t_el.text = text
 
-    new_bytes = ATAG_RE.sub(repl, xml_bytes)
-    return new_bytes, changed, matches
+def update_dimension(ws_root):
+    sd = ws_root.find(T("sheetData"))
+    if sd is None: return
+    max_row = 0; max_col = 0
+    for r in sd.findall(T("row")):
+        rn = int(r.get("r")); max_row = max(max_row, rn)
+        for c in r.findall(T("c")):
+            ref = c.get("r")
+            letters = "".join(ch for ch in ref if ch.isalpha())
+            n = 0
+            for ch in letters: n = n * 26 + (ord(ch.upper()) - 64)
+            max_col = max(max_col, n)
+    if max_row and max_col:
+        n = max_col; letters = ""
+        while n:
+            n, r = divmod(n - 1, 26)
+            letters = chr(65 + r) + letters
+        dim = ws_root.find(T("dimension"))
+        if dim is None:
+            dim = ET.Element(T("dimension"))
+            ws_root.insert(0, dim)
+        dim.set("ref", f"A1:{letters}{max_row}")
 
+# ---------- MAIN ----------
 def main():
-    print(f"[INFO] downloading {S3_IN}")
-    xdata = s3get(S3_IN)
-    work = Path("/tmp/xlsx_patch_safe")
-    unzip_to(xdata, work)
+    s3 = boto3.client("s3")
+    in_b, in_k = s3_split(S3_IN)
+    out_b, out_k = s3_split(S3_OUT)
 
-    drawings_dir = work/"xl"/"drawings"
-    if not drawings_dir.exists():
-        print("[INFO] No drawings folder found; nothing to patch.")
-        return
+    tmp = tempfile.mkdtemp(prefix="xlsx_b6g6_")
+    in_zip, out_zip = os.path.join(tmp, "in.xlsx"), os.path.join(tmp, "out.xlsx")
+    unz = os.path.join(tmp, "unz")
 
-    total_changes = 0
-    total_files = 0
-    for drawing in sorted(drawings_dir.glob("drawing*.xml")):
-        b = drawing.read_bytes()
-        nb, changed, matches = patch_drawing_xml_bytes(b)
-        print(f"[SCAN] {drawing.name}: blocks_matched={matches} changed={changed}")
-        if changed:
-            drawing.write_bytes(nb)
-            # debug upload of the individual drawing
-            s3put_bytes(S3_DBG_PREFIX + drawing.name, nb)
-            print(f"[DEBUG] uploaded patched {drawing.name} -> {S3_DBG_PREFIX + drawing.name}")
-            total_changes += matches
-            total_files += 1
+    # Download & unzip
+    s3.download_file(in_b, in_k, in_zip)
+    with zipfile.ZipFile(in_zip, "r") as zf:
+        zf.extractall(unz)
 
-    if total_changes == 0:
-        print("[INFO] No matching caption found in any drawing*.xml; workbook unchanged.")
-        return
+    for sheet_name, xml_relpath in SHEETS.items():
+        full_path = os.path.join(unz, xml_relpath)
+        if not os.path.exists(full_path):
+            print(f"⚠️ Missing: {sheet_name} ({xml_relpath}) — skipping")
+            continue
 
-    # rezip and upload
-    out_bytes = rezip_dir(work)
-    s3put_bytes(S3_OUT, out_bytes)
-    print(f"[SUCCESS] Patched {total_changes} block(s) across {total_files} file(s).")
-    print(f"[SUCCESS] Uploaded updated workbook -> {S3_OUT}")
+        ws_tree = ET.parse(full_path)
+        ws_root = ws_tree.getroot()
+
+        # Different logic for sheet8.xml (G/H columns)
+        if xml_relpath.endswith("sheet8.xml"):
+            print(f"✏️ Editing (G6/H6): {sheet_name}")
+            _, g4 = find_cell(ws_root, "G4")
+            style_g4 = g4.get("s") if (g4 is not None and g4.get("s")) else None
+            _, f4 = find_cell(ws_root, "F4")
+            style_f4 = f4.get("s") if (f4 is not None and f4.get("s")) else None
+            r6 = ensure_row(ws_root, 6)
+            g6 = ensure_cell(r6, "F", 6)
+            h6 = ensure_cell(r6, "G", 6)
+            set_inline_string(g6, "Performance Window", style_f4)
+            set_inline_string(h6, "08/10/19_09/10/19", style_g4)
+        else:
+            print(f"✏️ Editing (B6/C6): {sheet_name}")
+            _, b4 = find_cell(ws_root, "B4")
+            style_b4 = b4.get("s") if (b4 is not None and b4.get("s")) else None
+            r6 = ensure_row(ws_root, 6)
+            b6 = ensure_cell(r6, "B", 6)
+            c6 = ensure_cell(r6, "C", 6)
+            set_inline_string(b6, "Performance Window", style_b4)
+            set_inline_string(c6, "08/10/19_09/10/19", style_b4)
+
+        update_dimension(ws_root)
+        ws_tree.write(full_path, encoding="utf-8", xml_declaration=True)
+        print(f"✅ Done: {sheet_name}")
+
+    # Remove calcChain
+    calc_chain = os.path.join(unz, "xl", "calcChain.xml")
+    if os.path.exists(calc_chain):
+        os.remove(calc_chain)
+        print("🧹 Removed xl/calcChain.xml")
+
+    # Rezip
+    with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        for folder, _, files in os.walk(unz):
+            for fn in files:
+                full = os.path.join(folder, fn)
+                arc = os.path.relpath(full, unz)
+                z.write(full, arc)
+
+    s3.upload_file(out_zip, out_b, out_k)
+    print(f"🚀 Uploaded: {S3_OUT}")
 
 if __name__ == "__main__":
     main()
