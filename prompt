@@ -1,0 +1,35 @@
+s3://amp-output-test-files/standard-ara-test-case9/amp-std-step04-outputs/Input_record_counts_by_Segment/
+
+In this there is a .csv file in that the data is as follows 
+
+Seg	cnt
+Indianapolis Non-Attendee	15115
+Indianapolis Attendee	128
+
+
+s3://amp-output-test-files/standard-ara-test-case9/amp-std-step04-outputs/MSS-Used-MakeModel-data/
+
+In this folder there is .csv file which is having the data as follows 
+MakeModel	Seg	cnt
+Acura ILX	Indianapolis Non-Attendee	1
+Acura MDX	Indianapolis Non-Attendee	9
+Acura RDX	Indianapolis Non-Attendee	4
+Acura RSX	Indianapolis Non-Attendee	1
+And now the requirement is just group by makemodel and sort the make model ascending order  and then split by segments 
+
+Then 
+
+We want the output a csv file  for the new having 
+
+Makemodel seg_1 cnt_1 seg_2 cnt_2 total_cnt_1 total_cnt_2 vehiclemix_1 convrate_1   vehiclemix_2 conrate_2 ,total_vehicle_mix_1,total_conv_rate_1 total_vehicle_mix_2 total_conv_rate_2
+
+
+Now the values like Acura ILX,Indianapolis Non-Attendee,
+Vehiclemix1 formula is cnt_1/total_cnt_1*100
+
+conv_rate1 formula is cnt_1/total_vehicle_count_per_segment which is in the above file s3://amp-output-test-files/standard-ara-test-case9/amp-std-step04-outputs/Input_record_counts_by_Segment/ * 100
+
+Similarly for cnt_2 as well 
+
+total_cnt_1 is the sum of all the counts of the segment 1
+total_cnt_2 is the sum of all the counts of segmnet2
