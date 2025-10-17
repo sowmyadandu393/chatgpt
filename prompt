@@ -1,35 +1,155 @@
-s3://amp-output-test-files/standard-ara-test-case9/amp-std-step04-outputs/Input_record_counts_by_Segment/
+# -*- coding: utf-8 -*-
+"""
+Lambda: write two CSVs (NEW & USED) with just segment, median
 
-In this there is a .csv file in that the data is as follows 
+Event example:
+{
+  "S3_URI_NEW":  "s3://bucket/path/to/new/ or .../new.csv",
+  "S3_URI_USED": "s3://bucket/path/to/used/ or .../used.csv",
+  "OUT_URI_NEW":  "s3://bucket/outputs/median_new.csv",
+  "OUT_URI_USED": "s3://bucket/outputs/median_used.csv"
+}
 
-Seg	cnt
-Indianapolis Non-Attendee	15115
-Indianapolis Attendee	128
+Each output CSV schema:
+segment,median
+Segment A,12.500
+Segment B,18.000
+...
+"""
 
+import csv
+import io
+import json
+import fnmatch
+import boto3
+from urllib.parse import urlparse
+from statistics import median
 
-s3://amp-output-test-files/standard-ara-test-case9/amp-std-step04-outputs/MSS-Used-MakeModel-data/
+s3 = boto3.client("s3")
 
-In this folder there is .csv file which is having the data as follows 
-MakeModel	Seg	cnt
-Acura ILX	Indianapolis Non-Attendee	1
-Acura MDX	Indianapolis Non-Attendee	9
-Acura RDX	Indianapolis Non-Attendee	4
-Acura RSX	Indianapolis Non-Attendee	1
-And now the requirement is just group by makemodel and sort the make model ascending order  and then split by segments 
+# ---------- helpers ----------
+def parse_s3_uri(uri: str):
+    p = urlparse(uri)
+    if p.scheme != "s3":
+        raise ValueError(f"Invalid S3 URI: {uri}")
+    return p.netloc, p.path.lstrip("/")
 
-Then 
+def find_one_csv(s3_uri: str, patterns=None) -> str:
+    """Accepts file or folder; returns a single CSV file path."""
+    bucket, key = parse_s3_uri(s3_uri)
+    if key and not key.endswith("/"):
+        if not key.lower().endswith(".csv"):
+            raise ValueError(f"Expected a .csv file: {s3_uri}")
+        return f"s3://{bucket}/{key}"
 
-We want the output a csv file  for the new having 
+    prefix = key if key.endswith("/") else (key + "/" if key else "")
+    patterns = patterns or ["*.csv", "*.CSV"]
 
-Makemodel seg_1 cnt_1 seg_2 cnt_2 total_cnt_1 total_cnt_2 vehiclemix_1 convrate_1   vehiclemix_2 conrate_2 ,total_vehicle_mix_1,total_conv_rate_1 total_vehicle_mix_2 total_conv_rate_2
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            name = obj["Key"].split("/")[-1]
+            for pat in patterns:
+                if fnmatch.fnmatch(name, pat):
+                    return f"s3://{bucket}/{obj['Key']}"
+    raise FileNotFoundError(f"No .csv file found under {s3_uri}")
 
+def read_csv_records(s3_uri: str):
+    """Reads CSV to list[dict] with lower-cased, trimmed headers/values."""
+    bucket, key = parse_s3_uri(s3_uri)
+    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    text = body.decode("utf-8", errors="replace")
+    f = io.StringIO(text)
+    rdr = csv.DictReader(f)
+    rdr.fieldnames = [h.strip().lower() for h in rdr.fieldnames]
+    rows = []
+    for row in rdr:
+        rows.append({(k.strip().lower() if isinstance(k, str) else k):
+                     (v.strip() if isinstance(v, str) else v) for k, v in row.items()})
+    return rows
 
-Now the values like Acura ILX,Indianapolis Non-Attendee,
-Vehiclemix1 formula is cnt_1/total_cnt_1*100
+def to_float(x):
+    if x in (None, ""): return None
+    try:
+        return float(str(x).replace(",", ""))
+    except Exception:
+        return None
 
-conv_rate1 formula is cnt_1/total_vehicle_count_per_segment which is in the above file s3://amp-output-test-files/standard-ara-test-case9/amp-std-step04-outputs/Input_record_counts_by_Segment/ * 100
+def compute_medians(rows,
+                    seg_candidates=("seg", "segment"),
+                    val_candidates=("date_delta", "datedelta")):
+    """Return (ordered_segments, {seg: median})"""
+    if not rows:
+        return [], {}
 
-Similarly for cnt_2 as well 
+    cols = set(rows[0].keys())
 
-total_cnt_1 is the sum of all the counts of the segment 1
-total_cnt_2 is the sum of all the counts of segmnet2
+    def pick(cands):
+        for c in cands:
+            if c in cols:
+                return c
+        return None
+
+    seg_col = pick(seg_candidates)
+    val_col = pick(val_candidates)
+    if not seg_col or not val_col:
+        raise KeyError(f"Missing columns. Have={sorted(cols)}; need seg/date_delta")
+
+    buckets = {}
+    for r in rows:
+        seg = (r.get(seg_col) or "").strip()
+        v = to_float(r.get(val_col))
+        if not seg or v is None:
+            continue
+        buckets.setdefault(seg, []).append(v)
+
+    med = {}
+    for seg, vals in buckets.items():
+        vals.sort()  # ascending
+        med[seg] = float(median(vals)) if vals else 0.0
+
+    ordered = sorted(med.keys(), key=lambda s: s.lower())
+    return ordered, med
+
+def write_segment_median_csv(out_uri: str, ordered_segments, med_map):
+    bucket, key = parse_s3_uri(out_uri)
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["segment", "median"])
+    for seg in ordered_segments:
+        w.writerow([seg, f"{med_map.get(seg, 0.0):.3f}"])
+    s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue().encode("utf-8"))
+
+# ---------- handler ----------
+def lambda_handler(event, context):
+    s3_uri_new  = event.get("S3_URI_NEW")
+    s3_uri_used = event.get("S3_URI_USED")
+    out_new     = event.get("OUT_URI_NEW")
+    out_used    = event.get("OUT_URI_USED")
+
+    if not s3_uri_new or not s3_uri_used or not out_new or not out_used:
+        raise ValueError("Required: S3_URI_NEW, S3_URI_USED, OUT_URI_NEW, OUT_URI_USED")
+
+    # Resolve input files (must be .csv)
+    file_new  = find_one_csv(s3_uri_new)
+    file_used = find_one_csv(s3_uri_used)
+
+    # Read and compute medians
+    rows_new  = read_csv_records(file_new)
+    rows_used = read_csv_records(file_used)
+
+    segs_new,  med_new  = compute_medians(rows_new)
+    segs_used, med_used = compute_medians(rows_used)
+
+    # Write outputs (segment, median) only
+    write_segment_median_csv(out_new,  segs_new,  med_new)
+    write_segment_median_csv(out_used, segs_used, med_used)
+
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({
+            "source_files": {"new": file_new, "used": file_used},
+            "out_files": {"new": out_new, "used": out_used}
+        })
+    }
