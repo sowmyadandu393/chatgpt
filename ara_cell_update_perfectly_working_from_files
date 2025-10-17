@@ -1,0 +1,391 @@
+# -*- coding: utf-8 -*-
+# ================= amp_sand_cell_update_csv_for_ara_dashboard =================
+# Writes a CSV of [sheet, cell, value] updates covering:
+# - Charting Calculations (F7.. = segment labels from counts_by_segment)
+# - Summary Details (D9..D12)
+# - Time to Purchase Details - New/Used (rows 11-14 buckets, row 16 AVERAGES)
+# - Row 16 MEDIANS from STATIC CSVs only (no base-delta fallback):
+#       C16 = total_segments median,
+#       D16/E16/F16... = medians for segments in F7/F8/F9...
+# - Top Make/Model Details - New/Used (swapped % placements)
+# Rules: missing numerics => 0 (so % shows 0.00%); output values only (no formulas)
+
+import csv, io, re, gzip, fnmatch, sys, statistics as stats
+from urllib.parse import urlparse
+import boto3
+from awsglue.utils import getResolvedOptions
+
+# ----------- GLUE ARGS -----------
+args = getResolvedOptions(
+    sys.argv,
+    [
+        "INPUT_COUNTS_BY_SEGMENT",
+        "INPUT_BPS_DATA",
+        "INPUT_TPS_NEW",
+        "INPUT_TPS_USED",
+        "INPUT_TPS_NEW_BASEDELTA",     # used for C15 averages
+        "INPUT_TPS_USED_BASEDELTA",    # used for C15 averages
+        "OUT_URI",
+    ],
+)
+
+INPUT_COUNTS_BY_SEGMENT = args["INPUT_COUNTS_BY_SEGMENT"]
+INPUT_BPS_DATA          = args["INPUT_BPS_DATA"]
+INPUT_TPS_NEW           = args["INPUT_TPS_NEW"]
+INPUT_TPS_USED          = args["INPUT_TPS_USED"]
+INPUT_TPS_NEW_BASEDELTA = args["INPUT_TPS_NEW_BASEDELTA"]
+INPUT_TPS_USED_BASEDELTA= args["INPUT_TPS_USED_BASEDELTA"]
+OUT_URI                 = args["OUT_URI"]
+
+# ---- STATIC median CSVs (ALWAYS used; no fallback compute) ----
+STATIC_MEDIAN_NEW_CSV  = "s3://amp-output-test-files/standard-ara-test-case10/amp-std-step04-outputs/TPS-New-Used-DateDelta-data/median_new.csv"
+STATIC_MEDIAN_USED_CSV = "s3://amp-output-test-files/standard-ara-test-case10/amp-std-step04-outputs/TPS-New-Used-DateDelta-data/median_used.csv"
+
+# Sample Make/Model inputs (adjust if needed)
+INPUT_MAKEMODEL_NEW  = "s3://amp-output-test-files/standard-ara-test-case10/amp-std-step045-outputs/topmm_layout_new.csv"
+INPUT_MAKEMODEL_USED = "s3://amp-output-test-files/standard-ara-test-case9/amp-std-step045-outputs/topmm_layout_used.csv"
+
+s3 = boto3.client("s3")
+
+# ----------- HELPERS -----------
+def parse_s3_uri(uri: str):
+    p = urlparse(uri)
+    return p.netloc, p.path.lstrip("/")
+
+def folder_prefix(uri: str):
+    b, k = parse_s3_uri(uri)
+    if k and not k.endswith("/"):
+        k = "/".join(k.split("/")[:-1]) + "/"
+    if k and not k.endswith("/"):
+        k += "/"
+    return b, k
+
+def find_one_data_file(s3_uri_or_folder: str) -> str:
+    bucket, key = parse_s3_uri(s3_uri_or_folder)
+    if key and not key.endswith("/"):
+        return f"s3://{bucket}/{key}"
+    b, prefix = folder_prefix(s3_uri_or_folder)
+    patterns = ["part-*", "*.csv", "*.CSV", "*.txt", "*.TXT", "*.gz", "*.GZ"]
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=b, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            name = obj["Key"].split("/")[-1]
+            if any(fnmatch.fnmatch(name, pat) for pat in patterns):
+                return f"s3://{b}/{obj['Key']}"
+    raise FileNotFoundError(f"No data file found under {s3_uri_or_folder}")
+
+def read_csv_from_s3(s3_uri: str):
+    bucket, key = parse_s3_uri(s3_uri)
+    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    if key.lower().endswith(".gz"):
+        body = gzip.decompress(body)
+    text = body.decode("utf-8", errors="replace")
+    rdr = csv.DictReader(io.StringIO(text))
+    rdr.fieldnames = [(h.strip().lower() if isinstance(h, str) else h) for h in rdr.fieldnames]
+    rows = []
+    for r in rdr:
+        rows.append({
+            (k.strip().lower() if isinstance(k, str) else k):
+            (v.strip() if isinstance(v, str) else v)
+            for k, v in r.items()
+        })
+    return rows
+
+def excel_col(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def to_f(x):
+    try:
+        return float(str(x).replace(",", "")) if x not in (None, "") else 0.0
+    except Exception:
+        return 0.0
+
+def fmt_num(x):
+    f = to_f(x)
+    return str(int(f)) if abs(f - int(f)) < 1e-9 else f"{f:.3f}"
+
+def fmt_pct(num, den):
+    n, d = to_f(num), to_f(den)
+    return f"{(n/d*100.0):.2f}%" if d > 0 else "0.00%"
+
+def pretty_segment(seg):
+    return re.sub(r"\s{2,}", " ", (seg or "")).strip()
+
+# ----------- CHARTING CALC LABELS -----------
+def build_charting_labels(segments):
+    """
+    Charting Calculations!F7..Fx = segment names in order; returns (rows, [F7,F8,...] values)
+    """
+    sheet = "Charting Calculations"
+    rows = []
+    f_values = []
+    start_col = 6  # F
+    for i, seg in enumerate(segments):
+        col = excel_col(start_col + i)
+        val = pretty_segment(seg)
+        rows.append([sheet, f"{col}7", val])
+        f_values.append(val)
+    return rows, f_values
+
+# ----------- SUMMARY DETAILS -----------
+def build_summary_details(segments, bps_map):
+    rows = []
+    for i, seg in enumerate(segments):
+        col = excel_col(4 + i)  # D/E/F...
+        b = bps_map.get(seg, {})
+        rows.append(["Summary Details", f"{col}9",  fmt_num(b.get("record_count", 0))])
+        rows.append(["Summary Details", f"{col}10", fmt_num(b.get("match_count", 0))])
+        rows.append(["Summary Details", f"{col}11", fmt_num(b.get("purchase_count", 0))])
+        rows.append(["Summary Details", f"{col}12", fmt_num(b.get("vehicle_count", 0))])
+    return rows
+
+# ----------- TtP (buckets + averages only) -----------
+_R_RANGE = r"(?:-|–|—|_|to)"
+_RE_0_30  = re.compile(r"\b0\s*%s\s*30\b" % _R_RANGE)
+_RE_31_60 = re.compile(r"\b31\s*%s\s*60\b" % _R_RANGE)
+_RE_61_90 = re.compile(r"\b61\s*%s\s*90\b" % _R_RANGE)
+_RE_AVG   = re.compile(r"\baverage\b", re.IGNORECASE)
+_RE_90P   = re.compile(r"(?:90\+|>\s*90\b)")
+
+def classify_bucket(label: str) -> str:
+    if not label:
+        return "other"
+    s = re.sub(r"\s+", " ", label.strip().lower())
+    if _RE_AVG.search(s): return "avg"
+    if _RE_0_30.search(s): return "0_30"
+    if _RE_31_60.search(s): return "31_60"
+    if _RE_61_90.search(s): return "61_90"
+    if _RE_90P.search(s): return "other"
+    if re.search(r"\d+\s*%s\s*\d+" % _R_RANGE, s): return "other"
+    return "other"
+
+def build_time_to_purchase_updates(sheet_name, segments, tps_rows):
+    rows = [[sheet_name, "B14", "90+ Days"]]
+    by_seg = {}
+    for r in tps_rows:
+        seg = pretty_segment(r.get("seg"))
+        if seg:
+            by_seg.setdefault(seg, []).append(r)
+
+    segment_avgs = []
+    for i, seg in enumerate(segments):
+        col = excel_col(4 + i)  # D/E/F...
+        sums = {"0_30": 0.0, "31_60": 0.0, "61_90": 0.0, "other": 0.0}
+        avg_val = None
+        for r in by_seg.get(seg, []):
+            bucket = classify_bucket(r.get("daystopurchase") or "")
+            cnt = to_f(r.get("cnt", 0))
+            if bucket == "avg": avg_val = cnt
+            else: sums[bucket] += cnt
+
+        rows += [
+            [sheet_name, f"{col}11", fmt_num(sums["0_30"])],
+            [sheet_name, f"{col}12", fmt_num(sums["31_60"])],
+            [sheet_name, f"{col}13", fmt_num(sums["61_90"])],
+            [sheet_name, f"{col}14", fmt_num(sums["other"])],
+            [sheet_name, f"{col}16", fmt_num(avg_val or 0.0)],  # averages in row 16
+        ]
+        if avg_val is not None:
+            segment_avgs.append(avg_val)
+    return rows, segment_avgs
+
+# ----------- MEDIAN CSV (STATIC) -----------
+def read_median_csv_map(s3_uri_or_folder: str):
+    """
+    CSV headers: segment, median
+    Returns (dict{segment->median}, total_segments_median or None)
+    """
+    rows = read_csv_from_s3(find_one_data_file(s3_uri_or_folder))
+    per_seg, total_med = {}, None
+    for r in rows:
+        seg = pretty_segment(r.get("segment"))
+        med = to_f(r.get("median"))
+        if not seg:
+            continue
+        if seg.lower() == "total_segments":
+            total_med = med
+        else:
+            per_seg[seg] = med
+    return per_seg, total_med
+
+def build_tps_median_cells_from_map(sheet_name, cc_f_values, median_map, total_segments_median):
+    """
+    Map CC F7/F8/F9… -> D16/E16/F16… and set C16 from total_segments.
+    Missing segment medians => 0.0 per rules.
+    """
+    rows = []
+    if total_segments_median is not None:
+        rows.append([sheet_name, "C16", fmt_num(total_segments_median)])
+    for idx, label in enumerate(cc_f_values):
+        seg_name = pretty_segment(label)
+        col = excel_col(4 + idx)  # D,E,F...
+        val = median_map.get(seg_name, 0.0)
+        rows.append([sheet_name, f"{col}16", fmt_num(val)])
+    return rows
+
+# ---------- Top Make/Model helpers ----------
+def aggregate_makemodel(mm_rows):
+    def pick(d, names, default=None):
+        for n in names:
+            if n in d and d[n] not in (None, ""):
+                return d[n]
+        return default
+    agg = {}
+    for r in mm_rows:
+        rr = {k.lower(): v for k, v in r.items()}
+        mm = pick(rr, ["make_model", "makemodel", "make model", "model", "name"]) or rr.get("", None)
+        if not mm: continue
+        seg = pretty_segment(pick(rr, ["seg", "segment"]) or "")
+        cnt = to_f(pick(rr, ["cnt", "count", "record_count", "vehicle_count"], 0))
+        d = agg.setdefault(mm, {"total": 0.0, "by_seg": {}})
+        d["total"] += cnt
+        if seg: d["by_seg"][seg] = d["by_seg"].get(seg, 0.0) + cnt
+    return sorted(agg.items(), key=lambda kv: str(kv[0]).lower().strip())
+
+def write_cc_headers_to_top(sheet_name, cc_f_values, out_rows):
+    header_cols = ["F", "I", "L"]
+    for i, val in enumerate(cc_f_values[:len(header_cols)]):
+        out_rows.append([sheet_name, f"{header_cols[i]}15", val if val else ""])
+
+def build_top_mm_section(sheet_name, segments, ordered_mm, rc_by_seg, rc_all, cc_f_values):
+    rows = []
+    write_cc_headers_to_top(sheet_name, cc_f_values, rows)
+
+    for j, seg in enumerate(segments):
+        denom_col = excel_col(6 + 3*j)  # F, I, L, ...
+        rows.append([sheet_name, f"{denom_col}18", fmt_num(rc_by_seg.get(seg, 0.0))])
+    rows.append([sheet_name, "C18", fmt_num(rc_all)])
+
+    totals_by_seg = {seg: 0.0 for seg in segments}
+    grand_total_c = 0.0
+    start_row = 22
+    for idx, (mm, info) in enumerate(ordered_mm):
+        r = start_row + idx
+        c_val = float(info["total"] or 0.0); grand_total_c += c_val
+        rows.append([sheet_name, f"B{r}", str(mm)])
+        rows.append([sheet_name, f"C{r}", fmt_num(c_val)])
+        for j, seg in enumerate(segments):
+            col_letter = excel_col(6 + 3*j)
+            seg_cnt = float(info["by_seg"].get(seg, 0.0) or 0.0)
+            totals_by_seg[seg] += seg_cnt
+            rows.append([sheet_name, f"{col_letter}{r}", fmt_num(seg_cnt)])
+
+    if ordered_mm:
+        rows.append([sheet_name, "C20", fmt_num(grand_total_c)])
+        for j, seg in enumerate(segments):
+            count_col = excel_col(6 + 3*j)
+            rows.append([sheet_name, f"{count_col}20", fmt_num(totals_by_seg.get(seg, 0.0))])
+        rows.append([sheet_name, "D20", fmt_pct(grand_total_c, grand_total_c)])  # 100%
+        rows.append([sheet_name, "E20", fmt_pct(grand_total_c, rc_all)])         # conv
+
+        # per-seg totals (%)
+        for j, seg in enumerate(segments):
+            base_idx = 6 + 3*j  # F/I/L...
+            cnt20 = float(totals_by_seg.get(seg, 0.0) or 0.0)
+            denom18 = float(rc_by_seg.get(seg, 0.0) or 0.0)
+            mix_col = excel_col(base_idx + 1)  # G/J/M...
+            conv_col = excel_col(base_idx + 2) # H/K/N...
+            rows.append([sheet_name, f"{mix_col}20", fmt_pct(cnt20, cnt20)])
+            rows.append([sheet_name, f"{conv_col}20", fmt_pct(cnt20, denom18)])
+
+        # rows 22+ %
+        for idx, (mm, info) in enumerate(ordered_mm):
+            r = start_row + idx
+            c_val = float(info["total"] or 0.0)
+            rows.append([sheet_name, f"D{r}", fmt_pct(c_val, grand_total_c)])
+            rows.append([sheet_name, f"E{r}", fmt_pct(c_val, rc_all)])
+            for j, seg in enumerate(segments):
+                base_idx = 6 + 3*j
+                seg_cnt = float(info["by_seg"].get(seg, 0.0) or 0.0)
+                seg_total20 = float(totals_by_seg.get(seg, 0.0) or 0.0)
+                mix_col = excel_col(base_idx + 1)
+                conv_col = excel_col(base_idx + 2)
+                rows.append([sheet_name, f"{mix_col}{r}", fmt_pct(seg_cnt, seg_total20)])
+                rows.append([sheet_name, f"{conv_col}{r}", fmt_pct(seg_cnt, rc_by_seg.get(seg, 0.0))])
+    return rows
+
+# ----------- MAIN -----------
+def main():
+    # read inputs
+    counts_rows     = read_csv_from_s3(find_one_data_file(INPUT_COUNTS_BY_SEGMENT))
+    bps_rows        = read_csv_from_s3(find_one_data_file(INPUT_BPS_DATA))
+    new_rows        = read_csv_from_s3(find_one_data_file(INPUT_TPS_NEW))
+    used_rows       = read_csv_from_s3(find_one_data_file(INPUT_TPS_USED))
+    new_base_rows   = read_csv_from_s3(find_one_data_file(INPUT_TPS_NEW_BASEDELTA))   # for C15 avg-of-avgs
+    used_base_rows  = read_csv_from_s3(find_one_data_file(INPUT_TPS_USED_BASEDELTA))  # for C15 avg-of-avgs
+    mm_new_rows     = read_csv_from_s3(find_one_data_file(INPUT_MAKEMODEL_NEW))
+    mm_used_rows    = read_csv_from_s3(find_one_data_file(INPUT_MAKEMODEL_USED))
+
+    # segment order (from counts)
+    segments = []
+    for r in counts_rows:
+        s = pretty_segment(r.get("seg"))
+        if s: segments.append(s)
+
+    # BPS map (denominators etc.)
+    bps_map = {}
+    for r in bps_rows:
+        seg = pretty_segment(r.get("seg"))
+        if not seg: continue
+        bps_map[seg] = {
+            "record_count":   to_f(r.get("record_count", 0)),
+            "match_count":    to_f(r.get("match_count", 0)),
+            "purchase_count": to_f(r.get("purchase_count", 0)),
+            "vehicle_count":  to_f(r.get("vehicle_count", 0)),
+        }
+
+    rc_by_seg = {seg: float(bps_map.get(seg, {}).get("record_count", 0.0) or 0.0) for seg in segments}
+    rc_all = sum(rc_by_seg.values())
+
+    out = []
+    out.append(["sheet", "cell", "value"])
+
+    # Charting Calculations F7.. and capture F7/F8/F9 text
+    cc_rows, cc_f_values = build_charting_labels(segments)
+    out += cc_rows
+
+    # Summary Details
+    out += build_summary_details(segments, bps_map)
+
+    # Time to Purchase - buckets + AVERAGES (row 16)
+    new_tps_rows, new_avgs = build_time_to_purchase_updates("Time to Purchase Details - New", segments, new_rows)
+    used_tps_rows, used_avgs = build_time_to_purchase_updates("Time to Purchase Details - Used", segments, used_rows)
+    out += new_tps_rows + used_tps_rows
+
+    # Row 15: avg of avgs
+    if new_avgs:
+        out.append(["Time to Purchase Details - New",  "C15", fmt_num(sum(new_avgs)/len(new_avgs))])
+    if used_avgs:
+        out.append(["Time to Purchase Details - Used", "C15", fmt_num(sum(used_avgs)/len(used_avgs))])
+
+    # Row 16: MEDIANS from STATIC CSVs
+    print(f"Reading static median CSVs:\n  NEW:  {STATIC_MEDIAN_NEW_CSV}\n  USED: {STATIC_MEDIAN_USED_CSV}")
+    new_med_map,  new_total_med  = read_median_csv_map(STATIC_MEDIAN_NEW_CSV)
+    used_med_map, used_total_med = read_median_csv_map(STATIC_MEDIAN_USED_CSV)
+    out += build_tps_median_cells_from_map("Time to Purchase Details - New",  cc_f_values, new_med_map,  new_total_med)
+    out += build_tps_median_cells_from_map("Time to Purchase Details - Used", cc_f_values, used_med_map, used_total_med)
+
+    # Top Make/Model sections
+    out += build_top_mm_section("Top Make, Model Details - New",
+                                segments, aggregate_makemodel(mm_new_rows),
+                                rc_by_seg, rc_all, cc_f_values)
+    out += build_top_mm_section("Top Make, Model Details - Used",
+                                segments, aggregate_makemodel(mm_used_rows),
+                                rc_by_seg, rc_all, cc_f_values)
+
+    # write CSV to S3
+    csv_buf = io.StringIO()
+    writer = csv.writer(csv_buf, lineterminator="\n")
+    for r in out:
+        writer.writerow(r)
+    data = csv_buf.getvalue().encode("utf-8")
+    out_bucket, out_key = parse_s3_uri(OUT_URI)
+    boto3.client("s3").put_object(Bucket=out_bucket, Key=out_key, Body=data)
+    print(f"✅ Wrote {len(out)-1} updates to {OUT_URI}")
+
+if __name__ == "__main__":
+    main()
