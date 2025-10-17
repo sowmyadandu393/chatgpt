@@ -1,27 +1,27 @@
-# perfectly working performance window for all sheets
-
+# interchanging b5 to b6 
 # -*- coding: utf-8 -*-
 """
-Hardcoded multi-sheet update (no formulas):
-- For sheets 3–7: Copy B4 style to B6 & C6, set text
-- For sheet8.xml: Copy G4 style to G6 & H6, set text
+Sheets 3–7:
+  - Write B6="Performance Window", C6="08/10/19_09/10/19" with B4 style
+  - TRUE SWAP B5 <-> B6  (content + style)
+  - COPY C6 -> C5, then CLEAR C6
+Sheet8 untouched.
 """
 
 import os, zipfile, tempfile, boto3
 import xml.etree.ElementTree as ET
 
 # ---------- S3 CONFIG ----------
-S3_IN  = "s3://amp-caspex-sowmya/dashboard_output/Updated_Dashboard_Hamlin.xlsx"
-S3_OUT = "s3://amp-caspex-sowmya/dashboard_output/Updated_ss.xlsx"
+S3_IN  = "s3://amp-caspex-sowmya/dashboard_output/Updated_ss.xlsx"
+S3_OUT = "s3://amp-caspex-sowmya/dashboard_output/Updated_swapped_final.xlsx"
 
-# ---------- HARDCODED SHEET MAP ----------
+# ---------- SHEETS (3–7 only) ----------
 SHEETS = {
     "Summary Details": "xl/worksheets/sheet3.xml",
     "Time to Purchase Details - New": "xl/worksheets/sheet4.xml",
     "Time to Purchase Details - Used": "xl/worksheets/sheet5.xml",
     "Top Make, Model Details - New": "xl/worksheets/sheet6.xml",
     "Top Make, Model Details - Used": "xl/worksheets/sheet7.xml",
-    "Charting Calculations": "xl/worksheets/sheet8.xml",  # G6 & H6 update
 }
 
 # ---------- NAMESPACES ----------
@@ -35,7 +35,7 @@ for p, v in NS.items():
     ET.register_namespace("" if p == "main" else p, v)
 def T(local): return f"{{{NS['main']}}}{local}"
 
-# ---------- HELPERS ----------
+# ---------- helpers ----------
 def s3_split(uri):
     b, k = uri[5:].split("/", 1); return b, k
 
@@ -72,12 +72,37 @@ def find_cell(ws_root, a1):
 
 def set_inline_string(cell, text, style_index=None):
     for ch in list(cell): cell.remove(ch)
+    cell.attrib.pop("t", None)
     cell.set("t", "inlineStr")
     if style_index is not None: cell.set("s", style_index)
     is_el = ET.SubElement(cell, T("is"))
     t_el  = ET.SubElement(is_el, T("t"))
     t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
     t_el.text = text
+
+def deep_copy(elem):
+    new = ET.Element(elem.tag, elem.attrib)
+    new.text, new.tail = elem.text, elem.tail
+    for ch in list(elem): new.append(deep_copy(ch))
+    return new
+
+def clone_cell_contents(src, dst):
+    """Clone full XML (formula/value/inlineStr/style) from src -> dst."""
+    ref = dst.get("r")
+    for ch in list(dst): dst.remove(ch)
+    for k in list(dst.attrib.keys()):
+        if k != "r": dst.attrib.pop(k, None)
+    if src is not None:
+        for k, v in src.attrib.items():
+            if k != "r": dst.set(k, v)
+        for ch in list(src): dst.append(deep_copy(ch))
+    dst.set("r", ref)
+
+def clear_cell(cell):
+    if cell is None: return
+    for ch in list(cell): cell.remove(ch)
+    for k in list(cell.attrib.keys()):
+        if k not in ["r"]: cell.attrib.pop(k, None)
 
 def update_dimension(ws_root):
     sd = ws_root.find(T("sheetData"))
@@ -89,83 +114,87 @@ def update_dimension(ws_root):
             ref = c.get("r")
             letters = "".join(ch for ch in ref if ch.isalpha())
             n = 0
-            for ch in letters: n = n * 26 + (ord(ch.upper()) - 64)
+            for ch in letters: n = n*26 + (ord(ch.upper())-64)
             max_col = max(max_col, n)
     if max_row and max_col:
         n = max_col; letters = ""
         while n:
-            n, r = divmod(n - 1, 26)
-            letters = chr(65 + r) + letters
+            n, r = divmod(n-1, 26)
+            letters = chr(65+r) + letters
         dim = ws_root.find(T("dimension"))
         if dim is None:
             dim = ET.Element(T("dimension"))
             ws_root.insert(0, dim)
         dim.set("ref", f"A1:{letters}{max_row}")
 
-# ---------- MAIN ----------
+# ---------- main ----------
 def main():
     s3 = boto3.client("s3")
     in_b, in_k = s3_split(S3_IN)
     out_b, out_k = s3_split(S3_OUT)
 
-    tmp = tempfile.mkdtemp(prefix="xlsx_b6g6_")
+    tmp = tempfile.mkdtemp(prefix="xlsx_fix_swap_")
     in_zip, out_zip = os.path.join(tmp, "in.xlsx"), os.path.join(tmp, "out.xlsx")
     unz = os.path.join(tmp, "unz")
 
-    # Download & unzip
+    # fetch + unzip
     s3.download_file(in_b, in_k, in_zip)
-    with zipfile.ZipFile(in_zip, "r") as zf:
-        zf.extractall(unz)
+    with zipfile.ZipFile(in_zip, "r") as zf: zf.extractall(unz)
 
     for sheet_name, xml_relpath in SHEETS.items():
-        full_path = os.path.join(unz, xml_relpath)
-        if not os.path.exists(full_path):
-            print(f"⚠️ Missing: {sheet_name} ({xml_relpath}) — skipping")
-            continue
+        full = os.path.join(unz, xml_relpath)
+        if not os.path.exists(full):
+            print(f"⚠️ {sheet_name} missing ({xml_relpath}) — skip"); continue
 
-        ws_tree = ET.parse(full_path)
-        ws_root = ws_tree.getroot()
+        ws_tree = ET.parse(full); ws_root = ws_tree.getroot()
 
-        # Different logic for sheet8.xml (G/H columns)
-        if xml_relpath.endswith("sheet8.xml"):
-            print(f"✏️ Editing (G6/H6): {sheet_name}")
-            _, g4 = find_cell(ws_root, "G4")
-            style_g4 = g4.get("s") if (g4 is not None and g4.get("s")) else None
-            _, f4 = find_cell(ws_root, "F4")
-            style_f4 = f4.get("s") if (f4 is not None and f4.get("s")) else None
-            r6 = ensure_row(ws_root, 6)
-            g6 = ensure_cell(r6, "F", 6)
-            h6 = ensure_cell(r6, "G", 6)
-            set_inline_string(g6, "Performance Window", style_f4)
-            set_inline_string(h6, "08/10/19_09/10/19", style_g4)
-        else:
-            print(f"✏️ Editing (B6/C6): {sheet_name}")
-            _, b4 = find_cell(ws_root, "B4")
-            style_b4 = b4.get("s") if (b4 is not None and b4.get("s")) else None
-            r6 = ensure_row(ws_root, 6)
-            b6 = ensure_cell(r6, "B", 6)
-            c6 = ensure_cell(r6, "C", 6)
-            set_inline_string(b6, "Performance Window", style_b4)
-            set_inline_string(c6, "08/10/19_09/10/19", style_b4)
+        # styles from B4
+        _, b4 = find_cell(ws_root, "B4")
+        style_b4 = b4.get("s") if (b4 is not None and b4.get("s")) else None
+
+        # ensure rows/cells
+        r6 = ensure_row(ws_root, 6)
+        b6 = ensure_cell(r6, "B", 6)
+        c6 = ensure_cell(r6, "C", 6)
+
+        # write labels
+        set_inline_string(b6, "Performance Window", style_b4)
+        set_inline_string(c6, "08/10/19_09/10/19", style_b4)
+
+        # B5 <-> B6 true swap
+        _, b5 = find_cell(ws_root, "B5")
+        if b5 is None:
+            r5 = ensure_row(ws_root, 5)
+            b5 = ensure_cell(r5, "B", 5)
+        tmp = ET.Element(T("c"), {"r": "TMP"})
+        clone_cell_contents(b5, tmp)
+        clone_cell_contents(b6, b5)
+        clone_cell_contents(tmp, b6)
+
+        # COPY C6 -> C5, then CLEAR C6
+        _, c5 = find_cell(ws_root, "C5")
+        if c5 is None:
+            r5 = ensure_row(ws_root, 5)
+            c5 = ensure_cell(r5, "C", 5)
+        clone_cell_contents(c6, c5)
+        clear_cell(c6)
 
         update_dimension(ws_root)
-        ws_tree.write(full_path, encoding="utf-8", xml_declaration=True)
-        print(f"✅ Done: {sheet_name}")
+        ws_tree.write(full, encoding="utf-8", xml_declaration=True)
+        print(f"✅ {sheet_name} done")
 
-    # Remove calcChain
-    calc_chain = os.path.join(unz, "xl", "calcChain.xml")
-    if os.path.exists(calc_chain):
-        os.remove(calc_chain)
-        print("🧹 Removed xl/calcChain.xml")
+    # cleanup calcChain
+    calc = os.path.join(unz, "xl", "calcChain.xml")
+    if os.path.exists(calc):
+        os.remove(calc)
+        print("🧹 removed xl/calcChain.xml")
 
-    # Rezip
+    # rezip + upload
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
         for folder, _, files in os.walk(unz):
             for fn in files:
-                full = os.path.join(folder, fn)
-                arc = os.path.relpath(full, unz)
-                z.write(full, arc)
-
+                fp = os.path.join(folder, fn)
+                z.write(fp, os.path.relpath(fp, unz))
     s3.upload_file(out_zip, out_b, out_k)
     print(f"🚀 Uploaded: {S3_OUT}")
 
